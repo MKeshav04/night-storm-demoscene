@@ -6,11 +6,11 @@
 <title>Night Storm</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 13px/1.4 system-ui, sans-serif; color: #c9d1e0; }
-  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; }
-  #fps { position: fixed; top: 8px; left: 10px; opacity: .45; font-variant-numeric: tabular-nums; pointer-events: none; }
+  canvas#c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; }
+  #fps { position: fixed; top: 8px; left: 10px; opacity: .3; font-variant-numeric: tabular-nums; pointer-events: none; }
   #err { position: fixed; inset: 0; display: none; place-items: center; text-align: center; padding: 24px; background: #000; }
   .box { position: fixed; background: rgba(10, 12, 20, .72); border: 1px solid rgba(160, 175, 210, .18); border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
-  #hud { left: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; max-width: min(320px, calc(100vw - 48px)); }
+  #hud { left: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; max-width: min(320px, calc(100vw - 48px)); opacity: .75; }
   #hud button { font: inherit; color: inherit; background: #1d2538; border: 1px solid #3a4560; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
   #hud button:hover { background: #26304a; }
   #meter { width: 200px; height: 10px; border-radius: 3px; background: #0b0e16; display: none; }
@@ -22,20 +22,20 @@
   #panel label { display: block; margin: 8px 0 2px; font-size: 12px; }
   #panel input[type=range] { width: 100%; }
   #panel .row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
-  #hint { left: 50%; top: 18%; transform: translateX(-50%); text-align: center; pointer-events: none; transition: opacity 1.2s; opacity: .85; }
+  #hint { left: 50%; top: 40%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; transition: opacity 1.5s; opacity: .8; background: none; border: none; backdrop-filter: none; }
   #hint.gone { opacity: 0; }
-  #hint b { font-weight: 500; font-size: 16px; letter-spacing: .02em; }
-  #hint small { display: block; opacity: .6; margin-top: 4px; }
+  #hint b { font-weight: 400; font-size: 17px; letter-spacing: .03em; }
+  #hint small { display: block; opacity: .55; margin-top: 6px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="fps"></div>
-<div id="hint" class="box"><b>Click or clap to summon lightning</b><small>H settings · M mute</small></div>
+<div id="hint" class="box"><b>Click or clap to summon lightning</b><small>Count the seconds to the thunder: 3 s ≈ 1 km · H settings · M mute</small></div>
 
 <div id="hud" class="box">
   <button id="micBtn">Enable mic</button>
-  <canvas id="meter" width="200" height="10" title="Mic level. The line is the trigger threshold."></canvas>
+  <canvas id="meter" width="200" height="10" title="Mic level. The red line is the trigger threshold."></canvas>
   <div id="micMsg"></div>
 </div>
 
@@ -68,31 +68,33 @@ precision highp float;
 precision highp int;
 out vec4 outColor;
 
-// Coordinate system used everywhere below:
-//   p.y goes 0 (bottom) .. 1 (top), p.x goes 0 .. aspect (width/height).
-// Using the height as the unit keeps shapes round on any screen size.
+// We are looking up into an overcast night sky. Between strikes it is almost
+// black. Everything you see during a strike is light from the lightning:
+//   1. the visible channel (core + halo), drawn by JS into textures
+//   2. the cloud base lit from below by that channel (uWide)
+//   3. the cloud lit from inside by the in-cloud part of the discharge (uFlash)
+//   4. raindrops catching all of that light
+// Coordinates: p.y 0 (bottom) .. 1 (top), p.x 0 .. aspect. uv is 0..1 both ways.
 
-uniform vec2  uRes;     // canvas size in pixels
-uniform float uTime;    // seconds since start
-uniform float uRain;    // rain amount 0..1
-uniform float uCloud;   // cloud density 0..1
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uRain;       // rain amount 0..1
+uniform float uCloud;      // cloud density 0..1
+uniform float uFlash;      // in-cloud light right now, 0..~1.5
+uniform vec2  uFlashPos;   // centre of the in-cloud discharge (p coordinates)
+uniform float uMain;       // brightness of the main channel right now
+uniform float uBranch;     // brightness of the branches right now
+uniform sampler2D uCore;   // sharp bolt:     R = main channel, G = branches
+uniform sampler2D uHalo;   // blurred bolt:   the glow you see around the channel
+uniform sampler2D uWide;   // very blurred:   the light the bolt throws on the clouds
 
-// Lightning (all set from JavaScript when a strike happens)
-uniform float uFlash;      // overall sky/cloud brightness from the strike, 0..~1.5
-uniform float uBolt;       // how visible the bolt channel is right now, 0..1
-uniform vec2  uFlashPos;   // where the bolt starts inside the clouds
-uniform vec4  uSeg[64];    // bolt segments: xy = start, zw = end
-uniform float uSegB[64];   // brightness of each segment (branches are dimmer)
-uniform int   uSegCount;
-uniform vec4  uBoltBox;    // bounding box of the bolt: minX, minY, maxX, maxY
-
-const float WIND = 0.16;               // how far rain leans sideways per unit fallen
-const vec3  FLASH_COL = vec3(0.72, 0.78, 1.0); // lightning is blue-white
+const vec3 FLASH_COL = vec3(0.74, 0.78, 1.0);   // lightning is blue-white
+const float WIND = 0.12;
 
 // ---------------------------------------------------------------------------
-// Hashing: turn integer grid coordinates into repeatable pseudo-random numbers.
-// mixBits scrambles the bits of a 32-bit integer with xor-shifts and odd
-// multipliers, so neighbouring inputs give unrelated outputs.
+// Hashing: integer grid coordinates -> repeatable pseudo-random 0..1.
+// mixBits scrambles bits with xor-shifts and odd multipliers so neighbouring
+// inputs give unrelated outputs. +65536 keeps ints positive for int->uint.
 // ---------------------------------------------------------------------------
 uint mixBits(uint x) {
   x ^= x >> 16; x *= 0x7feb352du;
@@ -100,32 +102,24 @@ uint mixBits(uint x) {
   x ^= x >> 16;
   return x;
 }
-// +65536 keeps the ints positive so int->uint is always well defined.
-float hash11(float n) {
-  return float(mixBits(uint(int(n) + 65536)) >> 8) / 16777215.0;
-}
+float hash11(float n) { return float(mixBits(uint(int(n) + 65536)) >> 8) / 16777215.0; }
 float hash21(vec2 c) {
   uint h = mixBits(uint(int(c.x) + 65536) ^ mixBits(uint(int(c.y) + 65536)));
   return float(h >> 8) / 16777215.0;
 }
 
-// Value noise: random values on the corners of a grid cell, blended smoothly
-// across the cell. The f*f*(3-2f) curve has zero slope at the cell edges, so
-// there are no visible creases between cells.
+// Value noise: random values on grid corners, blended smoothly across the
+// cell. f*f*(3-2f) has zero slope at the edges, so no creases between cells.
 float vnoise(vec2 p) {
   vec2 i = floor(p), f = fract(p);
   vec2 u = f * f * (3.0 - 2.0 * f);
-  float a = hash21(i);
-  float b = hash21(i + vec2(1.0, 0.0));
-  float c = hash21(i + vec2(0.0, 1.0));
-  float d = hash21(i + vec2(1.0, 1.0));
-  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+  return mix(mix(hash21(i), hash21(i + vec2(1, 0)), u.x),
+             mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), u.x), u.y);
 }
 
-// fbm (fractal Brownian motion): add several noise layers ("octaves"), each at
-// double the frequency and half the strength of the previous one. Big soft
-// shapes + smaller and smaller detail = something that looks like cloud.
-// Rotating between octaves hides the grid alignment of the value noise.
+// fbm: several noise layers, each double the frequency and half the strength.
+// Big soft shapes plus finer and finer detail reads as cloud. Rotating between
+// octaves hides the grid alignment of value noise.
 float fbm(vec2 p, int octaves) {
   const mat2 R = mat2(0.8, -0.6, 0.6, 0.8);
   float sum = 0.0, amp = 0.5, norm = 0.0;
@@ -136,214 +130,126 @@ float fbm(vec2 p, int octaves) {
     p = R * p * 2.03 + 17.1;
     amp *= 0.5;
   }
-  return sum / norm; // back to roughly 0..1
+  return sum / norm;
 }
 
 // ---------------------------------------------------------------------------
-// Clouds. Returns x = coverage (0 clear sky .. 1 solid cloud), y = raw noise
-// value, which we reuse as "thickness" for shading.
+// Cloud density (0 = gap, 1 = thick cloud) at screen point p.
+// Domain warp: we bend the lookup position with a second, coarse noise, so
+// the shapes billow and fold like the lumpy base of a storm cloud instead of
+// looking like round blurry blobs.
 // ---------------------------------------------------------------------------
-vec2 clouds(vec2 p) {
-  // Squash vertically: storm clouds are wide, flat-bottomed layers.
-  vec2 q = vec2(p.x * 1.1, p.y * 2.4) + vec2(uTime * 0.015, 0.0);
-  // Domain warp: offset the lookup by another noise so edges billow
-  // instead of looking like plain blurry blobs.
-  float warp = fbm(q * 0.7 + vec2(0.0, uTime * 0.008), 3);
-  float n = fbm(q * 1.6 + warp * 1.4 + vec2(uTime * 0.01, 0.0), 5);
-  // More cloud higher up, density slider shifts everything.
-  float height = smoothstep(0.15, 0.9, p.y);
-  float cover = n + (height - 0.5) * 0.35 + (uCloud - 0.5) * 0.6;
-  return vec2(smoothstep(0.38, 0.72, cover), n);
+float cloudDensity(vec2 p, int octaves) {
+  vec2 q = p * 1.5 + vec2(uTime * 0.010, uTime * 0.004);
+  vec2 w = vec2(fbm(q * 0.5, 2), fbm(q * 0.5 + 5.2, 2));
+  float n = fbm(q + (w - 0.5) * 1.8, octaves);
+  float lo = 0.60 - uCloud * 0.40;
+  return smoothstep(lo, lo + 0.32, n);
 }
 
-// Tiny stars, only seen through gaps in the clouds.
-float stars(vec2 p) {
-  vec2 g = p * 160.0;
-  vec2 cell = floor(g);
-  float r = hash21(cell);
-  if (r > 0.06) return 0.0;                         // ~6% of cells get a star
-  vec2 pos = vec2(hash21(cell + 3.1), hash21(cell + 7.7)) - 0.5;
-  float d = length(fract(g) - 0.5 - pos * 0.7);
-  float twinkle = 0.6 + 0.4 * sin(uTime * (1.0 + r * 30.0) + r * 100.0);
-  return smoothstep(0.12, 0.0, d) * twinkle * (0.3 + r * 8.0);
+// How much light gets from the in-cloud discharge at l to point p.
+// We step along the line p -> l, add up the cloud density we pass through
+// and use Beer's law: light left = exp(-total material in the way).
+// Thick lumps between you and the source become dark, thin parts glow:
+// that is what gives the flash its 3D, lit-from-inside look.
+float transmittance(vec2 p, vec2 l) {
+  float sum = 0.0;
+  for (int i = 1; i <= 4; i++) sum += cloudDensity(mix(p, l, float(i) / 5.0), 2);
+  return exp(-sum * length(l - p) * 2.2);
 }
 
 // ---------------------------------------------------------------------------
-// Landscape: two ridge lines made of 1D noise (noise sampled along x only).
-// ---------------------------------------------------------------------------
-// y = 0 so we read one row of the grid (y = 0.5 would average two rows and
-// flatten the result toward 0.5).
-float noise1(float x) { return vnoise(vec2(x, 0.0)); }
-
-float farRidge(float x) {
-  return 0.18 + 0.10 * (noise1(x * 2.2 + 3.0) * 0.6 + noise1(x * 6.0 + 1.0) * 0.3 + noise1(x * 17.0) * 0.1);
-}
-
-// Conifer silhouettes: split x into slots, some slots get a triangle "tree".
-float trees(float x) {
-  float g = x * 30.0;
-  float cell = floor(g);
-  float r = hash11(cell);
-  float clump = smoothstep(0.2, 0.4, noise1(x * 2.5 + 11.0)); // trees grow in clumps
-  if (r > 0.75 * clump) return 0.0;
-  float lx = fract(g) - 0.5 - (hash11(cell + 71.0) - 0.5) * 0.24;
-  float h = 0.018 + 0.03 * hash11(cell + 13.0);
-  float t = 1.0 - abs(lx) / 0.36;                  // triangle profile
-  t *= 0.85 + 0.15 * step(0.5, fract(t * 4.0));    // little tiers of branches
-  return max(0.0, h * t);
-}
-
-float nearRidge(float x) {
-  return 0.07 + 0.09 * noise1(x * 1.4 + 40.0) + 0.02 * noise1(x * 8.0) + trees(x);
-}
-
-// Warm, slightly flickering town lights on the far hills.
-float townLights(vec2 p, float near, float far) {
-  if (p.y > far - 0.004 || p.y < near) return 0.0;
-  float town = smoothstep(0.55, 0.75, noise1(p.x * 1.3 + 5.0));
-  if (town <= 0.0) return 0.0;
-  vec2 g = p * vec2(140.0, 260.0);
-  vec2 cell = floor(g);
-  float r = hash21(cell + 50.0);
-  if (r > 0.12) return 0.0;
-  vec2 pos = vec2(hash21(cell + 1.3), hash21(cell + 2.9)) - 0.5;
-  vec2 d = (fract(g) - 0.5 - pos * 0.6) / vec2(140.0, 260.0);   // back to uv units
-  float flicker = 0.85 + 0.15 * sin(uTime * 3.0 + r * 60.0);   // rain shimmering in front
-  return town * exp(-dot(d, d) / 1.6e-6) * flicker * (0.4 + r * 3.0);
-}
-
-// ---------------------------------------------------------------------------
-// Rain: one layer of streaks. The screen is cut into vertical columns; each
-// column is cut into cells along y. A cell holds at most one drop. Scrolling
-// the y lookup by time makes the drops fall; skewing x by y makes them lean.
-//   cols   = columns across one screen height (more = smaller, farther)
-//   cellH  = cell height in screen units (controls spacing + streak length)
-//   speed  = fall speed in screen heights per second
+// Rain: one layer of streaks. Columns across the screen, cells along y, at
+// most one drop per cell. Scrolling the y lookup by time makes drops fall;
+// skewing x by y makes them lean in the wind.
 // ---------------------------------------------------------------------------
 float rainLayer(vec2 p, float cols, float cellH, float speed, float seed, float amount) {
   p.x += p.y * WIND + seed;
   float x = p.x * cols;
   float ci = floor(x);
   float colRnd = hash21(vec2(ci, seed * 31.0));
-  // Each column falls at a slightly different speed so rows don't line up.
   float y = p.y / cellH + uTime * speed / cellH * (0.85 + 0.3 * colRnd) + colRnd * 50.0;
   float di = floor(y);
-  float f = fract(y);                        // 0 = bottom of cell, 1 = top
-  float dropRnd = hash21(vec2(ci + seed * 7.0, di));
-  if (dropRnd > amount) return 0.0;          // this cell is empty
+  float f = fract(y);
+  if (hash21(vec2(ci + seed * 7.0, di)) > amount) return 0.0;
   float xo = (hash21(vec2(di, ci + seed * 3.0)) - 0.5) * 0.5;
-  float dx = abs(fract(x) - 0.5 - xo);
-  float across = 1.0 - smoothstep(0.0, 0.07, dx);
-  // The head of the drop is the lowest point (it's falling), the tail fades upward.
+  float across = 1.0 - smoothstep(0.0, 0.07, abs(fract(x) - 0.5 - xo));
+  // Head of the drop is its lowest point (it is falling); tail fades upward.
   float along = smoothstep(0.0, 0.05, f) * (1.0 - smoothstep(0.0, 0.55, f));
   return across * along * (0.6 + 0.4 * hash11(di + ci));
 }
 
-// ---------------------------------------------------------------------------
-// Lightning glow.
-// segDist: shortest distance from point p to the line segment a-b. Project p
-// onto the line, clamp the projection to the segment (h in 0..1), measure.
-// ---------------------------------------------------------------------------
-float segDist(vec2 p, vec2 a, vec2 b) {
-  vec2 pa = p - a, ba = b - a;
-  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-  return length(pa - ba * h);
-}
-
-// Returns x = hot core, y = soft halo. For every segment we compute the
-// distance and keep the strongest response (max, not sum, so overlapping
-// segments at joints don't double up into bright dots).
-vec2 boltGlow(vec2 p) {
-  if (uSegCount == 0 || uBolt <= 0.001) return vec2(0.0);
-  // Cheap early exit: pixels far from the bolt's box can't get any glow.
-  const float M = 0.3;
-  if (p.x < uBoltBox.x - M || p.x > uBoltBox.z + M || p.y < uBoltBox.y - M || p.y > uBoltBox.w + M) return vec2(0.0);
-  float core = 0.0, halo = 0.0;
-  for (int i = 0; i < 64; i++) {
-    if (i >= uSegCount) break;
-    float d = segDist(p, uSeg[i].xy, uSeg[i].zw);
-    float b = uSegB[i];
-    // Gaussian core about 1px wide: exp(-d^2 / 2sigma^2) with sigma ~ 0.0011.
-    core = max(core, b * exp(-d * d * 4.0e5));
-    // Halo: an exponential "bloom" near the channel plus a long 1/(1+d^2) tail.
-    halo = max(halo, b * (0.6 * exp(-d * 70.0) + 0.3 / (1.0 + d * d * 900.0)));
-  }
-  return vec2(core, halo) * uBolt;
-}
-
-// ACES-style filmic tone curve: squeezes bright HDR values into 0..1 smoothly
-// instead of clipping, and keeps the darks dark. Coefficients are the
-// widely published Narkowicz curve fit.
+// Filmic tone curve (the widely published Narkowicz ACES fit): squeezes very
+// bright values smoothly into 0..1 instead of clipping, keeps darks dark.
 vec3 toneMap(vec3 x) {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 void main() {
-  vec2 frag = gl_FragCoord.xy;
-  vec2 p = frag / uRes.y;                // height-normalised coordinates
-  vec2 uv = frag / uRes;                 // 0..1 in both axes (for vignette)
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec2 p = gl_FragCoord.xy / uRes.y;
+  vec2 ch = vec2(uMain, uBranch);
 
-  // ---- sky ----
-  vec3 col = mix(vec3(0.020, 0.024, 0.036), vec3(0.006, 0.008, 0.016), p.y);
-  vec3 townGlow = vec3(0.045, 0.022, 0.010);         // orange light pollution
-  col += townGlow * exp(-max(p.y - 0.15, 0.0) * 6.0);
+  float d = cloudDensity(p, 5);
 
-  vec2 cl = clouds(p);
-  float cov = cl.x, thick = cl.y;
-  col += vec3(0.8, 0.85, 1.0) * stars(p) * 0.05 * pow(1.0 - cov, 3.0);
+  // Night ambient: almost nothing. Cloud is a hair lighter than the gaps, so
+  // with dark-adapted eyes you can just sense shapes. Nothing more.
+  vec3 col = vec3(0.0020, 0.0022, 0.0030) + vec3(0.0030, 0.0032, 0.0040) * d;
+  float light = 0.0;   // how lit this spot is; used for the rain below
 
-  // Cloud colour: dim blue-grey, underside tinted by the town glow.
-  vec3 cloudCol = vec3(0.028, 0.031, 0.040) * (0.55 + 0.9 * thick)
-                + townGlow * 0.9 * exp(-max(p.y - 0.2, 0.0) * 3.0);
-  col = mix(col, cloudCol, cov * 0.95);
+  // Light from the visible channel (blurred far out), hitting the cloud base.
+  float wide = dot(texture(uWide, uv).rg, ch);
 
-  // ---- lightning lighting the sky ----
-  // Light from the strike is strongest around where the bolt leaves the
-  // cloud (uFlashPos) and spreads through the whole cloud deck more weakly.
-  // Thick cloud scatters more light back at us than the gaps between clouds.
-  float local = exp(-length((p - uFlashPos) * vec2(0.8, 1.6)) * 3.0);
-  col += FLASH_COL * uFlash * (0.12 + cov * (0.35 + 3.0 * local) * (0.4 + thick));
+  if (uFlash > 0.002 || wide > 0.0005) {
+    // In-cloud discharge: light spreads from uFlashPos through the cloud.
+    // The falloff is an ellipse, wider than tall: cloud layers are flat.
+    float fall = exp(-length((p - uFlashPos) * vec2(0.65, 1.15)) * 2.0);
+    float T = uFlash * fall > 0.004 ? transmittance(p, uFlashPos) : 0.0;
+    float inCloud = uFlash * (0.03 + fall * (0.08 + 1.4 * T));
+    // Light from the channel: cloud base facing us reflects more where denser.
+    float fromBolt = wide * 3.0;
+    light = inCloud + fromBolt;
+    // d*d: thin cloud stays dim, thick billows catch the light. That
+    // contrast is what makes the cloud look solid instead of like fog.
+    float dd = d * d;
+    col += FLASH_COL * (inCloud * (0.06 + 1.3 * dd) + fromBolt * (0.04 + 1.4 * dd));
+  }
 
-  // ---- the bolt itself ----
-  vec2 g = boltGlow(p);
-  // Up inside the cloud base the channel is hidden by cloud, so only its glow shows.
-  float hidden = cov * smoothstep(0.6, 0.85, p.y);
-  col += vec3(1.0) * g.x * 9.0 * (1.0 - 0.85 * hidden);
-  col += FLASH_COL * g.y * (1.6 + cov * 1.5);
+  // The channel itself, in front of the cloud base.
+  float core = dot(texture(uCore, uv).rg, ch);
+  float halo = dot(texture(uHalo, uv).rg, ch);
+  col += vec3(1.0, 0.97, 1.0) * core * 16.0;
+  col += vec3(0.62, 0.66, 1.0) * halo * 2.2;
+  light += halo * 0.6;
 
-  // ---- landscape (drawn after the bolt so hills hide its lower end) ----
-  float far = farRidge(p.x);
-  float near = nearRidge(p.x);
-  // Mist hugging the far hills; the flash lights it up too.
-  col += (vec3(0.020, 0.020, 0.026) + FLASH_COL * uFlash * 0.25) * exp(-abs(p.y - far) * 25.0);
-  if (p.y < far) col = vec3(0.010, 0.011, 0.016) + FLASH_COL * uFlash * 0.05;
-  col += vec3(1.0, 0.55, 0.22) * townLights(p, near, far) * 4.0;
-  if (p.y < near) col = vec3(0.003, 0.004, 0.006) + FLASH_COL * uFlash * 0.012;
-
-  // ---- rain (in front of everything) ----
+  // Rain: you only really see it when lightning lights it up.
   float amt = uRain * 0.7;
   float rain = rainLayer(p, 22.0, 0.16, 1.40, 0.0, amt)
              + rainLayer(p, 45.0, 0.10, 1.00, 3.1, amt) * 0.55
              + rainLayer(p, 90.0, 0.06, 0.70, 7.3, amt) * 0.3;
-  // Drops catch the flash: barely visible normally, bright streaks during a strike.
-  col += vec3(0.55, 0.6, 0.7) * rain * (0.07 + 1.2 * uFlash);
-  col += vec3(0.010, 0.011, 0.014) * uRain;          // overall wet haze
+  col += vec3(0.6, 0.64, 0.75) * rain * (0.004 + light * 0.2);
 
-  // ---- finishing ----
-  col = toneMap(col * 0.6);                                 // 0.6 = exposure
-  col *= 1.0 - 0.45 * pow(length(uv - 0.5) * 1.15, 2.2);   // vignette
-  col = pow(col, vec3(1.0 / 2.2));                          // linear -> screen gamma
-  col += (hash21(frag + fract(uTime) * 1000.0) - 0.5) * 0.012; // film grain (also hides banding)
-  outColor = vec4(col, 1.0);
+  // Finishing: exposure, tone map, gentle vignette, gamma, film grain
+  // (grain also hides colour banding in the near-black gradients).
+  col = toneMap(col * 0.8);
+  col *= 1.0 - 0.3 * pow(length(uv - 0.5) * 1.15, 2.2);
+  col = pow(col, vec3(1.0 / 2.2));
+  col += (hash21(gl_FragCoord.xy + fract(uTime) * 1000.0) - 0.5) * 0.010;
+  outColor = vec4(max(col, 0.0), 1.0);
 }
 </script>
 
 <script>
 'use strict';
 // ===========================================================================
-// Settings (the panel edits these later)
+// Settings (the panel edits these)
 // ===========================================================================
-const settings = { sensitivity: 5, rain: 0.55, clouds: 0.65, scale: 0.75, headphones: false };
+const settings = { sensitivity: 5, rain: 0.55, clouds: 0.7, scale: 0.75, headphones: false };
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+// Roughly bell-shaped random number, mean 0, spread ~1 (sum of 3 uniforms).
+const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) * 2;
 
 // ===========================================================================
 // WebGL2 setup
@@ -375,8 +281,32 @@ gl.useProgram(prog);
 gl.bindVertexArray(gl.createVertexArray()); // empty VAO: the vertex shader makes its own positions
 
 const U = {};
-for (const name of ['uRes', 'uTime', 'uRain', 'uCloud', 'uFlash', 'uBolt', 'uFlashPos',
-                    'uSeg', 'uSegB', 'uSegCount', 'uBoltBox']) U[name] = gl.getUniformLocation(prog, name);
+for (const name of ['uRes', 'uTime', 'uRain', 'uCloud', 'uFlash', 'uFlashPos', 'uMain', 'uBranch',
+                    'uCore', 'uHalo', 'uWide']) U[name] = gl.getUniformLocation(prog, name);
+
+// Three bolt textures on texture units 0, 1, 2. Start as 1×1 black.
+function makeTexture(unit) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  return { t, unit };
+}
+const tex = { core: makeTexture(0), halo: makeTexture(1), wide: makeTexture(2) };
+gl.uniform1i(U.uCore, 0);
+gl.uniform1i(U.uHalo, 1);
+gl.uniform1i(U.uWide, 2);
+
+function uploadTexture({ t, unit }, source) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);  // canvas y goes down, GL y goes up
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+}
 
 // Render at (CSS size × device pixel ratio × render scale); the browser
 // stretches the canvas back up to full screen. Lower scale = fewer pixels to shade.
@@ -394,218 +324,482 @@ addEventListener('resize', resize);
 resize();
 
 // ===========================================================================
-// Bolt generator (runs on the CPU once per strike)
-// Coordinates match the shader: y 0..1 bottom to top, x 0..aspect.
+// Bolt shape (CPU, once per strike). Units: y 0..1 bottom to top, x 0..aspect.
+// Real lightning is a chain of short, randomly angled steps (the "stepped
+// leader" feels its way down ~50 m at a time), with wandering on bigger
+// scales too. So we walk toward the target in tiny steps, each one turned by
+// a random angle, plus a slowly drifting "meander" for the large-scale bends.
 // ===========================================================================
-const MAX_SEGS = 64;
-const rand = (a, b) => a + Math.random() * (b - a);
+const STEP = 0.0075;   // one step ≈ 6 px on a 810 px tall render
 
-// Midpoint displacement: take a straight line, push its midpoint sideways by a
-// random amount, then do the same to the two halves with half the push, and so
-// on. Big zig-zags first, smaller and smaller kinks after: a jagged channel.
-function displace(ax, ay, bx, by, levels, jitter) {
-  let pts = [[ax, ay], [bx, by]];
-  for (let lvl = 0; lvl < levels; lvl++) {
-    const next = [pts[0]];
-    for (let i = 0; i < pts.length - 1; i++) {
-      const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
-      const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
-      const off = rand(-1, 1) * jitter;
-      // (-dy, dx)/len is the direction perpendicular to the segment.
-      next.push([(x1 + x2) / 2 - dy / len * off, (y1 + y2) / 2 + dx / len * off], pts[i + 1]);
-    }
-    pts = next;
-    jitter *= 0.5;
+function walkTo(x, y, tx, ty) {
+  const pts = [[x, y]];
+  let meander = 0;
+  for (let i = 0; i < 800 && Math.hypot(tx - x, ty - y) > STEP; i++) {
+    meander = clamp(meander + gauss() * 0.16, -0.7, 0.7);
+    const kink = Math.random() < 0.07 ? gauss() * 0.9 : 0;    // occasional sharp jog
+    const a = Math.atan2(ty - y, tx - x) + meander + gauss() * 0.42 + kink;
+    const l = STEP * rand(0.4, 1.5);
+    x += Math.cos(a) * l;
+    y += Math.sin(a) * l;
+    pts.push([x, y]);
   }
   return pts;
 }
 
-function makeBolt(targetX, strength) {
-  const segs = []; // [ax, ay, bx, by, brightness]
-  const sx = targetX + rand(-0.18, 0.18), sy = rand(0.86, 0.95);
-  // End below the horizon: the hills drawn in front hide where it really lands.
-  const main = displace(sx, sy, targetX + rand(-0.02, 0.02), 0.05, 5, 0.11); // 2^5 = 32 segments
-  for (let i = 0; i < main.length - 1; i++) segs.push([...main[i], ...main[i + 1], 1.0]);
-
-  // Branches: start from a random point on the upper part of the main channel,
-  // fork off sideways and downward, dimmer and fading toward their tips.
-  const branches = Math.round(1 + strength * 3);
-  for (let b = 0; b < branches && segs.length + 8 <= MAX_SEGS; b++) {
-    const [x0, y0] = main[Math.floor(rand(2, main.length * 0.6))];
-    const side = Math.random() < 0.5 ? -1 : 1;
-    const ang = side * rand(0.35, 0.9);           // radians away from straight down
-    const len = rand(0.08, 0.25) * (0.6 + strength * 0.6);
-    const pts = displace(x0, y0, x0 + Math.sin(ang) * len, y0 - Math.cos(ang) * len, 3, 0.04);
-    const base = rand(0.35, 0.6);
-    for (let i = 0; i < pts.length - 1; i++)
-      segs.push([...pts[i], ...pts[i + 1], base * (1 - i / (pts.length - 1)) + 0.05]);
+// A branch has no target: it keeps a general heading and wanders.
+function walkDir(x, y, ang, len) {
+  const pts = [[x, y]];
+  let meander = 0, done = 0;
+  while (done < len) {
+    meander = clamp(meander + gauss() * 0.2, -0.8, 0.8);
+    const a = ang + meander + gauss() * 0.45;
+    const l = STEP * rand(0.4, 1.4);
+    x += Math.cos(a) * l;
+    y += Math.sin(a) * l;
+    done += l;
+    pts.push([x, y]);
   }
-  return segs;
+  return pts;
+}
+
+// Each line: { pts, ch: 0 main / 1 branch, w0, w1 (width start/end), b0, b1 (brightness), fadeIn }
+function makeBolt(cx, size) {
+  const lines = [];
+  const sx = cx + rand(-0.25, 0.25), sy = rand(0.95, 1.12);   // starts in the cloud, often above the screen
+  const main = walkTo(sx, sy, cx + rand(-0.06, 0.06), -0.1);  // exits below the screen
+  lines.push({ pts: main, ch: 0, w0: 1, w1: 1, b0: 1, b1: 1, fadeIn: 10 });
+
+  // Branches: more of them high up (where the leader forked most), heading
+  // down and outward, thinner and fading to nothing at their tips.
+  function branch(pts, i0, depth, bright, width) {
+    const [x, y] = pts[i0];
+    const [px, py] = pts[Math.max(0, i0 - 3)];
+    const heading = Math.atan2(y - py, x - px);               // local direction of the parent
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const ang = clamp(heading + side * rand(0.3, 1.0), -Math.PI + 0.3, -0.3); // keep it going downward
+    const len = rand(0.05, 0.3) * (0.4 + y * 0.8) / (depth + 1);
+    const bp = walkDir(x, y, ang, len);
+    lines.push({ pts: bp, ch: 1, w0: width, w1: width * 0.3, b0: bright, b1: 0 });
+    if (depth < 2) for (let i = 3; i < bp.length; i++)
+      if (Math.random() < 0.035) branch(bp, i, depth + 1, bright * 0.6, width * 0.7);
+  }
+  const maxBranches = Math.round(rand(4, 9) * (0.6 + size * 0.4));
+  let made = 0;
+  for (let i = 8; i < main.length - 5 && made < maxBranches; i++) {
+    const y = main[i][1];
+    if (Math.random() < 0.05 * clamp(y + 0.2, 0.2, 1)) { branch(main, i, 0, rand(0.35, 0.7), 0.65); made++; }
+  }
+  // A few faint channels crawling sideways inside the cloud near the top.
+  const n = Math.floor(rand(1, 4));
+  for (let k = 0; k < n; k++) {
+    const ang = (Math.random() < 0.5 ? 0 : Math.PI) + gauss() * 0.3;
+    // inCloud: hidden by the cloud, so it's left out of the sharp layer and only glows through.
+    lines.push({ pts: walkDir(sx, Math.min(sy, 0.97), ang, rand(0.15, 0.45)), ch: 1, w0: 1.5, w1: 0.8, b0: 0.5, b1: 0.05, fadeIn: 6, inCloud: true });
+  }
+  return { lines, start: [sx, Math.min(sy, 0.92)] };
+}
+
+// Draw all lines into a 2D canvas: main channel in red, branches in green.
+// 'lighten' keeps the brightest value per pixel, so where segments overlap at
+// joints they don't add up into bright dots.
+function drawLines(c, lines, aspect, widthPx) {
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.filter = 'none';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighten';
+  ctx.lineCap = 'round';
+  for (const L of lines) {
+    const n = L.pts.length - 1;
+    for (let i = 0; i < n; i++) {
+      const f = i / n;
+      let b = L.b0 + (L.b1 - L.b0) * f;
+      if (L.fadeIn) b *= Math.min(1, (i + 1) / L.fadeIn);   // emerging from the cloud
+      const v = Math.round(255 * clamp(b, 0, 1));
+      if (v < 2) continue;
+      ctx.strokeStyle = L.ch === 0 ? `rgb(${v},0,0)` : `rgb(0,${v},0)`;
+      ctx.lineWidth = Math.max(0.5, (L.w0 + (L.w1 - L.w0) * f) * widthPx);
+      const [x0, y0] = L.pts[i], [x1, y1] = L.pts[i + 1];
+      ctx.beginPath();
+      ctx.moveTo(x0 / aspect * W, (1 - y0) * H);
+      ctx.lineTo(x1 / aspect * W, (1 - y1) * H);
+      ctx.stroke();
+    }
+  }
+}
+
+const boltCanvas = { core: document.createElement('canvas'), tmp: document.createElement('canvas'),
+                     halo: document.createElement('canvas'), wide: document.createElement('canvas') };
+
+function blurInto(dst, src, px, add) {
+  const ctx = dst.getContext('2d');
+  ctx.globalCompositeOperation = add ? 'lighter' : 'source-over';
+  ctx.filter = `blur(${px}px)`;
+  ctx.drawImage(src, 0, 0, dst.width, dst.height);
+  ctx.filter = 'none';
+}
+
+// Render the bolt at three blur levels and upload them as textures.
+// Blur radii are in pixels of each (smaller) canvas, so they're cheap.
+function renderBolt(lines, size) {
+  const W = Math.min(canvas.width, 2048), H = Math.round(W * canvas.height / canvas.width);
+  const aspect = canvas.width / canvas.height;
+  const sizeCanvas = (c, w, h) => { if (c.width !== w || c.height !== h) { c.width = w; c.height = h; } };
+
+  sizeCanvas(boltCanvas.core, W, H);
+  drawLines(boltCanvas.core, lines.filter(L => !L.inCloud), aspect, H * 0.0024 * size); // ~2 px main channel
+
+  // Halo: half resolution, lines drawn thicker, then blurred twice (tight + loose).
+  const hw = W >> 1, hh = H >> 1;
+  sizeCanvas(boltCanvas.tmp, hw, hh);
+  sizeCanvas(boltCanvas.halo, hw, hh);
+  drawLines(boltCanvas.tmp, lines, aspect, hh * 0.006 * size);
+  drawLines(boltCanvas.halo, [], aspect, 1);                           // clear to black
+  blurInto(boltCanvas.halo, boltCanvas.tmp, 2);
+  blurInto(boltCanvas.halo, boltCanvas.tmp, 7, true);
+
+  // Wide: 1/8 resolution, thick lines, heavy blur. This is the light that
+  // spills onto the clouds, so it must be smooth and far-reaching.
+  const ww = Math.max(8, W >> 3), wh = Math.max(8, H >> 3);
+  sizeCanvas(boltCanvas.tmp, ww, wh);
+  sizeCanvas(boltCanvas.wide, ww, wh);
+  drawLines(boltCanvas.tmp, lines, aspect, 3);
+  drawLines(boltCanvas.wide, [], aspect, 1);
+  blurInto(boltCanvas.wide, boltCanvas.tmp, 6);
+  blurInto(boltCanvas.wide, boltCanvas.tmp, 16, true);
+
+  uploadTexture(tex.core, boltCanvas.core);
+  uploadTexture(tex.halo, boltCanvas.halo);
+  uploadTexture(tex.wide, boltCanvas.wide);
 }
 
 // ===========================================================================
-// Strike manager: flicker envelope + uploading the bolt to the shader
+// Strike timing. A real cloud-to-ground flash is several "return strokes"
+// down the same channel, 30-120 ms apart. The first stroke lights up all the
+// branches; later strokes only light the main channel. Sometimes the cloud
+// flickers just before the bolt appears, and sometimes the channel keeps
+// glowing for a moment after a stroke ("continuing current").
 // ===========================================================================
-const segData = new Float32Array(MAX_SEGS * 4);
-const segBright = new Float32Array(MAX_SEGS);
-const strike = { active: false, start: 0, pulses: [], strength: 0, end: 0 };
+const strike = { active: false, start: 0, events: [], end: 0, size: 1, gain: 1 };
 
 function triggerStrike(xFrac, strength) {
   const aspect = canvas.width / canvas.height;
-  const x = xFrac * aspect;
-  const segs = makeBolt(x, strength);
+  // Distance in km: louder clap / stronger strike = closer. Close bolts are
+  // bigger and brighter, and their thunder comes sooner and louder.
+  const distKm = clamp((2.4 - strength * 2.0) * rand(0.85, 1.15), 0.35, 3);
+  const size = clamp(Math.pow(0.9 / distKm, 0.5), 0.6, 1.5);
 
-  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
-  segData.fill(0); segBright.fill(0);
-  segs.forEach((s, i) => {
-    segData.set(s.slice(0, 4), i * 4);
-    segBright[i] = s[4];
-    minX = Math.min(minX, s[0], s[2]); maxX = Math.max(maxX, s[0], s[2]);
-    minY = Math.min(minY, s[1], s[3]); maxY = Math.max(maxY, s[1], s[3]);
-  });
-  gl.uniform4fv(U.uSeg, segData);
-  gl.uniform1fv(U.uSegB, segBright);
-  gl.uniform1i(U.uSegCount, segs.length);
-  gl.uniform4f(U.uBoltBox, minX, minY, maxX, maxY);
-  gl.uniform2f(U.uFlashPos, segs[0][0], segs[0][1] - 0.05);
+  const bolt = makeBolt(xFrac * aspect, size);
+  renderBolt(bolt.lines, size);
+  gl.uniform2f(U.uFlashPos, bolt.start[0], bolt.start[1]);
 
-  // Real lightning flickers: the channel re-fires 2-4 times along the same
-  // path within half a second. Each pulse jumps up instantly, decays fast.
-  const now = performance.now() / 1000;
-  const pulses = [{ t: 0, a: 1, tau: 0.07 }];
+  const ev = [];
   let t = 0;
-  const n = 1 + Math.floor(rand(1, 4));
-  for (let i = 0; i < n; i++) {
-    t += rand(0.05, 0.17);
-    pulses.push({ t, a: rand(0.45, 1.0), tau: rand(0.04, 0.09) });
+  if (Math.random() < 0.5) {                 // in-cloud flicker before the bolt
+    ev.push({ t: 0, main: 0, branch: 0, cloud: rand(0.12, 0.3), tau: 0.04 });
+    t = rand(0.05, 0.14);
   }
-  pulses.push({ t: 0, a: 0.22, tau: 0.4, cloudOnly: true }); // slow afterglow in the clouds
-  Object.assign(strike, { active: true, start: now, pulses, strength, end: t + 1.8 });
+  const first = t;
+  ev.push({ t, main: 1, branch: 1, cloud: 1, tau: 0.05 });
+  const strokes = Math.floor(rand(1, 5));    // 1-4 more strokes
+  for (let i = 0; i < strokes; i++) {
+    t += rand(0.035, 0.12);
+    ev.push({ t, main: rand(0.4, 0.95), branch: 0.06, cloud: rand(0.45, 0.85), tau: rand(0.035, 0.06) });
+    if (Math.random() < 0.25)                // continuing current: a lingering glow
+      ev.push({ t: t + 0.01, main: 0.3, branch: 0, cloud: 0.25, tau: rand(0.1, 0.18) });
+  }
+  ev.push({ t: first, main: 0, branch: 0, cloud: 0.2, tau: 0.35 });   // clouds' slow afterglow
+  Object.assign(strike, { active: true, start: performance.now() / 1000, events: ev, end: t + 2, size,
+                          gain: 0.5 + strength * 0.7 });
 
-  playThunder(strength);
-  document.getElementById('hint')?.classList.add('gone');
+  scheduleThunder(distKm, xFrac);
+  document.getElementById('hint').classList.add('gone');
 }
 
 function updateStrike(now) {
-  if (!strike.active) return { flash: 0, bolt: 0 };
+  const out = { flash: 0, main: 0, branch: 0 };
+  if (!strike.active) return out;
   const t = now - strike.start;
-  if (t > strike.end) { strike.active = false; gl.uniform1i(U.uSegCount, 0); return { flash: 0, bolt: 0 }; }
-  let env = 0, channel = 0;
-  for (const p of strike.pulses) {
-    if (t < p.t) continue;
-    const v = p.a * Math.exp(-(t - p.t) / p.tau);
-    env += v;
-    if (!p.cloudOnly) channel += v;   // the bolt itself only follows the fast pulses
+  if (t > strike.end) { strike.active = false; return out; }
+  for (const e of strike.events) {
+    if (t < e.t) continue;
+    const k = Math.exp(-(t - e.t) / e.tau);   // each stroke: instant peak, fast decay
+    out.flash += e.cloud * k;
+    out.main += e.main * k;
+    out.branch += e.branch * k;
   }
-  return {
-    flash: Math.min(1.6, env * (0.5 + strike.strength * 0.8)),
-    bolt: Math.min(1, channel * 1.6) * (0.6 + strike.strength * 0.4),
-  };
+  out.flash = Math.min(1.6, out.flash * strike.gain * strike.size);
+  out.main = Math.min(1.4, out.main) * (0.7 + 0.3 * strike.size);
+  out.branch = Math.min(1.2, out.branch) * (0.7 + 0.3 * strike.size);
+  return out;
 }
 
 // ===========================================================================
-// Audio: synthesized thunder + a steady medium rain bed. No sound files.
-// Browsers only allow audio after a user gesture, so this starts on the
-// first click or key press.
+// Audio. Everything is synthesized; there are no sound files.
+// Browsers only allow audio after a user gesture, so it starts on the first
+// click or key press. Buffers that don't need the AudioContext (rain, echo)
+// are computed right after page load at 48 kHz; the browser resamples them.
 // ===========================================================================
-const audio = { ctx: null, master: null, white: null, brown: null, rainGain: null, thunderUntil: 0, muted: false };
+const SR = 48000;
+const audio = { ctx: null, master: null, rainGain: null, reverb: null, muted: false, thunders: [] };
 
-function noiseBuffer(ctx, seconds, brown) {
-  const buf = ctx.createBuffer(1, ctx.sampleRate * seconds, ctx.sampleRate);
-  const d = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < d.length; i++) {
-    const w = Math.random() * 2 - 1;
-    // Brown noise = running sum of white noise (leaky so it doesn't drift).
-    // It's heavy in low frequencies: the natural base for a rumble.
-    if (brown) { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w;
+// Rain: thousands of individual drop "ticks" (tiny decaying pings at random
+// pitches, mostly quiet, a few loud ones close by) over a soft hiss. Drops wrap
+// around the end of the buffer so the 6 s loop has no audible seam.
+function makeRainData() {
+  const N = SR * 6, chans = [];
+  for (let c = 0; c < 2; c++) {
+    const d = new Float32Array(N);
+    let lp = 0;
+    for (let i = 0; i < N; i++) { lp += (Math.random() * 2 - 1 - lp) * 0.25; d[i] = lp * 0.12; }
+    for (let k = 0; k < 6 * 900; k++) {
+      const pos = Math.floor(Math.random() * N);
+      const amp = Math.pow(Math.random(), 3) * 0.5;
+      const w = 2 * Math.PI * rand(1200, 6000) / SR;
+      const decay = rand(0.001, 0.005) * SR;
+      for (let j = 0, len = decay * 4; j < len; j++) d[(pos + j) % N] += amp * Math.exp(-j / decay) * Math.sin(w * j);
+    }
+    chans.push(d);
   }
-  return buf;
+  return chans;
+}
+
+// Echo: stereo impulse response for a ConvolverNode. Decaying noise (the
+// diffuse echo of the land and clouds) plus a few distinct reflections, like
+// thunder bouncing off distant hills.
+function makeEchoData() {
+  const N = SR * 4, chans = [];
+  for (let c = 0; c < 2; c++) {
+    const d = new Float32Array(N);
+    let lp = 0;
+    for (let i = 0; i < N; i++) {
+      lp += (Math.random() * 2 - 1 - lp) * 0.08;    // dull: echoes lose their highs
+      d[i] = lp * Math.exp(-i / (SR * 0.9));
+    }
+    for (let k = 0; k < 6; k++) {
+      const at = Math.floor(rand(0.12, 1.6) * SR);
+      for (let j = 0; j < 2000; j++) d[at + j] += (Math.random() * 2 - 1) * 0.25 * Math.exp(-j / 400) * Math.exp(-at / (SR * 1.2));
+    }
+    chans.push(d);
+  }
+  return chans;
+}
+
+let rainData = null, echoData = null;
+setTimeout(() => { rainData = makeRainData(); echoData = makeEchoData(); }, 300);
+
+function toBuffer(ctx, chans) {
+  const b = ctx.createBuffer(chans.length, chans[0].length, SR);
+  chans.forEach((d, i) => b.copyToChannel(d, i));
+  return b;
 }
 
 function ensureAudio() {
   if (audio.ctx) { if (audio.ctx.state === 'suspended') audio.ctx.resume(); return; }
+  if (!rainData) { rainData = makeRainData(); echoData = makeEchoData(); }
   const ctx = new AudioContext();
   audio.ctx = ctx;
-  // master gain (mute) -> compressor (stops loud strikes from clipping) -> speakers
+  // master gain (mute) -> compressor (keeps close strikes from clipping) -> speakers
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -12; comp.ratio.value = 4;
+  comp.threshold.value = -10; comp.ratio.value = 4; comp.attack.value = 0.003;
   audio.master = ctx.createGain();
   audio.master.gain.value = audio.muted ? 0 : 1;
   audio.master.connect(comp).connect(ctx.destination);
-  audio.white = noiseBuffer(ctx, 4, false);
-  audio.brown = noiseBuffer(ctx, 8, true);
 
-  // Rain bed: looping white noise band-limited to the "hiss" range of rain
-  // hitting the ground, plus a quieter low layer for body.
+  audio.reverb = ctx.createConvolver();
+  audio.reverb.buffer = toBuffer(ctx, echoData);
+  const wet = ctx.createGain(); wet.gain.value = 0.45;
+  audio.reverb.connect(wet).connect(audio.master);
+
   const src = ctx.createBufferSource();
-  src.buffer = audio.white; src.loop = true;
-  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 600;
-  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 6500;
-  const body = ctx.createBiquadFilter(); body.type = 'lowpass'; body.frequency.value = 500;
-  const bodyGain = ctx.createGain(); bodyGain.gain.value = 0.5;
+  src.buffer = toBuffer(ctx, rainData);
+  src.loop = true;
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 250;
   audio.rainGain = ctx.createGain();
   audio.rainGain.gain.value = 0;
-  src.connect(hp).connect(lp).connect(audio.rainGain);
-  src.connect(body).connect(bodyGain).connect(audio.rainGain);
-  audio.rainGain.connect(audio.master);
+  src.connect(hp).connect(audio.rainGain).connect(audio.master);
   src.start();
 }
 
 function updateRainSound(t) {
   if (!audio.ctx) return;
-  // Volume follows the rain slider, with a slow gentle swell so it feels alive.
-  const target = settings.rain * 0.09 * (0.88 + 0.12 * Math.sin(t * 0.37) * Math.sin(t * 0.11));
+  const target = settings.rain * 0.5 * (0.88 + 0.12 * Math.sin(t * 0.37) * Math.sin(t * 0.11));
   audio.rainGain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.3);
 }
 
-function playThunder(strength) {
+// ---------------------------------------------------------------------------
+// Thunder from physics.
+// Thunder is the shock wave from the whole lightning channel. Every few
+// metres of channel sends out its own sharp pressure pulse (an "N-wave":
+// pressure jumps up, falls below normal, returns). You hear each one when it
+// arrives: distance / 343 m/s. The nearest part of the channel arrives first
+// (the crack), the far parts high in the cloud arrive seconds later (the long
+// roll). Where a stretch of channel is side-on to you, its pulses arrive
+// together and pile up into a loud clap; stretches pointing at you smear out
+// into rumble. Air also absorbs high frequencies with distance, so the later,
+// farther sound is duller. We simulate exactly that.
+// ---------------------------------------------------------------------------
+function buildThunder(distM) {
+  const C = 343;
+  const segs = [];               // x, y, z, energy per ~6 m of channel
+  const STEP_M = 6;
+
+  // Random walk in 3D: keep some of the last direction, add a random push,
+  // and lean toward `bias`. Gives a tortuous channel like real lightning.
+  function walk3(p, bias, len, energy, stopZ) {
+    let [x, y, z] = p, dx = bias[0], dy = bias[1], dz = bias[2], done = 0;
+    const path = [];
+    while (done < len) {
+      dx += gauss() * 0.55 + bias[0] * 0.6;
+      dy += gauss() * 0.55 + bias[1] * 0.6;
+      dz += gauss() * 0.55 + bias[2] * 0.6;
+      const m = Math.hypot(dx, dy, dz);
+      dx /= m; dy /= m; dz /= m;
+      const l = STEP_M * rand(0.5, 1.5);
+      x += dx * l; y += dy * l; z = Math.max(0, z + dz * l); done += l;
+      segs.push(x, y, z, energy * l / STEP_M);
+      path.push([x, y, z]);
+      if (stopZ && z > stopZ) break;
+    }
+    return path;
+  }
+  const az = rand(0, Math.PI * 2);
+  const ground = [Math.cos(az) * distM, Math.sin(az) * distM, 0];
+  const cloudBase = rand(1300, 2200);
+  const main = walk3(ground, [0, 0, 1], 8000, 1, cloudBase);
+  const top = main[main.length - 1];
+  for (let k = 0, n = Math.floor(rand(3, 7)); k < n; k++) {         // branches below the cloud
+    const from = main[Math.floor(rand(0.3, 0.95) * main.length)];
+    const a = rand(0, Math.PI * 2);
+    walk3(from, [Math.cos(a) * 0.6, Math.sin(a) * 0.6, -0.8], rand(150, 600), 0.35);
+  }
+  for (let k = 0, n = Math.floor(rand(2, 4)); k < n; k++) {         // long channels inside the cloud
+    const a = rand(0, Math.PI * 2);
+    walk3(top, [Math.cos(a), Math.sin(a), 0.25], rand(1500, 3500), 0.5);
+  }
+
+  // Distance from the listener (standing at the origin, ears at 1.7 m).
+  const count = segs.length / 4, r = new Float32Array(count);
+  let rMin = Infinity, rMax = 0;
+  for (let i = 0; i < count; i++) {
+    r[i] = Math.hypot(segs[i * 4], segs[i * 4 + 1], segs[i * 4 + 2] - 1.7);
+    rMin = Math.min(rMin, r[i]); rMax = Math.max(rMax, r[i]);
+  }
+  const PRE = 0.05;                                       // 50 ms of silence first
+  const N = Math.floor(Math.min((rMax - rMin) / C + 2.5, 20) * SR);
+  const x = new Float32Array(N);
+
+  // 1) Add one N-wave per channel piece at its arrival time. Its length sets
+  //    the pitch: ~10-30 ms gives thunder's typical 35-100 Hz. It stretches
+  //    with distance (deeper) and gets quieter as 1/r (spherical spreading).
+  for (let i = 0; i < count; i++) {
+    const start = Math.floor(((r[i] - rMin) / C + PRE) * SR);
+    const len = Math.floor((0.009 + 0.006 * r[i] / 1000) * rand(0.6, 1.6) * SR);
+    if (start + len >= N) continue;
+    const A = segs[i * 4 + 3] * 1000 / r[i];
+    for (let k = 0; k < len; k++) x[start + k] += A * (1 - 2 * k / len);
+  }
+
+  // 2) Air absorption: low-pass filter whose cutoff falls over time, because
+  //    sound arriving at time t travelled rMin + 343·t metres. Two one-pole
+  //    filters in a row = a steeper slope.
+  let a = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < N; i++) {
+    if ((i & 255) === 0) {
+      const dist = rMin + C * Math.max(0, i / SR - PRE);
+      const fc = Math.min(7000, 1400 * Math.pow(1000 / dist, 1.1));   // 400 m ≈ 3.8 kHz, 3 km ≈ 420 Hz
+      a = 1 - Math.exp(-2 * Math.PI * fc / SR);
+    }
+    y1 += a * (x[i] - y1);
+    y2 += a * (y1 - y2);
+    x[i] = y2;
+  }
+
+  // 3) Body: deep rumble (brown noise) that swells and fades with the
+  //    loudness of the pulses, filling the gaps the way the real roll does.
+  let env = 0, brown = 0, b2 = 0, b3 = 0, peakX = 1e-9, peakR = 1e-9;
+  const rum = new Float32Array(N);
+  const ke = 1 / (0.08 * SR);
+  const kb = 1 - Math.exp(-2 * Math.PI * 180 / SR);     // extra filtering: keep it below ~180 Hz
+  for (let i = 0; i < N; i++) {
+    env += (Math.abs(x[i]) - env) * ke;
+    brown = (brown + 0.02 * (Math.random() * 2 - 1)) / 1.02;
+    b2 += kb * (brown - b2);
+    b3 += kb * (b2 - b3);
+    rum[i] = b3 * env;
+    peakX = Math.max(peakX, Math.abs(x[i]));
+    peakR = Math.max(peakR, Math.abs(rum[i]));
+  }
+  let peak = 1e-9;
+  for (let i = 0; i < N; i++) { x[i] = x[i] / peakX * 0.75 + rum[i] / peakR * 0.6; peak = Math.max(peak, Math.abs(x[i])); }
+
+  // Envelope in 50 ms blocks with a slow release: used to mute the mic only
+  // while the thunder is actually loud (instead of for its whole tail).
+  const block = SR / 20, envBlocks = new Float32Array(Math.ceil(N / block));
+  let held = 0;
+  for (let b = 0; b < envBlocks.length; b++) {
+    let m = 0;
+    for (let i = b * block; i < Math.min(N, (b + 1) * block); i++) m = Math.max(m, Math.abs(x[i]) / peak);
+    held = Math.max(m, held * 0.9);           // ~0.5 s release, covers the echo
+    envBlocks[b] = held;
+  }
+  for (let i = 0; i < N; i++) x[i] /= peak;
+  return { data: x, delay: rMin / C - PRE, env: envBlocks };
+}
+
+// Building thunder takes ~0.1 s of maths, which would freeze the animation.
+// So it runs in a Web Worker (a background thread). We make the worker from
+// the source text of the functions above, so it's still one HTML file.
+const thunderWorker = new Worker(URL.createObjectURL(new Blob([`
+  const SR = ${SR}; const rand = ${rand}; const clamp = ${clamp}; const gauss = ${gauss};
+  ${buildThunder}
+  onmessage = e => {
+    const th = buildThunder(e.data.distM);
+    postMessage({ id: e.data.id, ...th }, [th.data.buffer, th.env.buffer]);
+  };`], { type: 'text/javascript' })));
+const thunderJobs = new Map();
+let thunderId = 0;
+thunderWorker.onmessage = e => { thunderJobs.get(e.data.id)?.(e.data); thunderJobs.delete(e.data.id); };
+
+// Ask the worker for a thunder, then start it exactly when the first sound
+// would arrive (flash time + nearest distance / speed of sound).
+function scheduleThunder(distKm, xFrac) {
   ensureAudio();
   const ctx = audio.ctx;
-  // Distance in km. Stronger strikes tend to be closer. Sound travels ~1 km in 3 s.
-  const dist = 0.1 + Math.pow(Math.random(), 1.5) * 1.6 * (1.2 - strength * 0.5);
-  const t0 = ctx.currentTime + dist * 3;
-  const close = dist < 0.6;
-  const dur = rand(3, 4) + Math.min(dist, 1.5) * 1.3;   // ~3-6 s
-  const loud = Math.max(0.15, Math.min(1, strength * (1.15 - dist * 0.35)));
+  const flashAt = ctx.currentTime;
+  const perfFlash = performance.now() / 1000;
+  const id = ++thunderId;
+  thunderWorker.postMessage({ id, distM: distKm * 1000 });
+  thunderJobs.set(id, th => {
+    const buf = ctx.createBuffer(1, th.data.length, SR);
+    buf.copyToChannel(th.data, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const loud = clamp(Math.pow(0.7 / distKm, 0.8), 0.12, 1);
+    const g = ctx.createGain(); g.gain.value = loud;
+    const pan = ctx.createStereoPanner(); pan.pan.value = clamp((xFrac - 0.5) * 1.4, -0.7, 0.7);
+    src.connect(g).connect(pan);
+    pan.connect(audio.master);
+    pan.connect(audio.reverb);
+    const when = flashAt + th.delay;
+    if (when > ctx.currentTime) src.start(when);
+    else src.start(ctx.currentTime, ctx.currentTime - when);   // built late: skip ahead to stay in sync
+    audio.thunders.push({ start: perfFlash + th.delay, env: th.env, loud });
+  });
+}
 
-  // Rumble: brown noise -> two lowpass filters. Closer = brighter (higher cutoff).
-  const src = ctx.createBufferSource(); src.buffer = audio.brown;
-  const lp1 = ctx.createBiquadFilter(); lp1.type = 'lowpass';
-  const lp2 = ctx.createBiquadFilter(); lp2.type = 'lowpass'; lp2.frequency.value = 400;
-  lp1.frequency.setValueAtTime(close ? 420 : rand(140, 260), t0);
-  lp1.frequency.setTargetAtTime(90, t0 + 0.3, dur * 0.35);   // high end dies first as it rolls away
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0, t0);
-  const attack = close ? 0.03 : rand(0.25, 0.5);
-  g.gain.linearRampToValueAtTime(loud * (close ? 1 : 0.75), t0 + attack);
-  // "Rolling": jump between random levels every 0.12-0.45 s under a decaying curve.
-  for (let t = t0 + attack; t < t0 + dur;) {
-    t += rand(0.12, 0.45);
-    const left = Math.max(0, 1 - (t - t0) / dur);
-    g.gain.linearRampToValueAtTime(loud * Math.pow(left, 1.5) * rand(0.35, 1), Math.min(t, t0 + dur));
+// How loud our own thunder is coming out of the speakers right now (0..1).
+function thunderLevel(now) {
+  let lvl = 0;
+  audio.thunders = audio.thunders.filter(th => now < th.start + th.env.length / 20 + 1);
+  for (const th of audio.thunders) {
+    const b = Math.floor((now - th.start) * 20);
+    if (b >= 0 && b < th.env.length) lvl = Math.max(lvl, th.env[b] * th.loud);
   }
-  g.gain.linearRampToValueAtTime(0, t0 + dur + 0.3);
-  src.connect(lp1).connect(lp2).connect(g).connect(audio.master);
-  src.start(t0, rand(0, 2));
-  src.stop(t0 + dur + 0.5);
-
-  // Close strike: a sharp crack first (short burst of high-passed noise).
-  if (close) {
-    const c = ctx.createBufferSource(); c.buffer = audio.white;
-    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1200;
-    const cg = ctx.createGain();
-    cg.gain.setValueAtTime(0, t0);
-    cg.gain.linearRampToValueAtTime(loud * 0.9, t0 + 0.005);
-    cg.gain.exponentialRampToValueAtTime(0.001, t0 + rand(0.2, 0.35));
-    c.connect(hp).connect(cg).connect(audio.master);
-    c.start(t0, rand(0, 3));
-    c.stop(t0 + 0.4);
-  }
-  // Remember (in performance.now() seconds) when this thunder ends,
-  // so the mic can ignore our own speakers until then.
-  const endPerf = performance.now() / 1000 + (t0 + dur + 0.3 - ctx.currentTime);
-  audio.thunderUntil = Math.max(audio.thunderUntil, endPerf);
+  return audio.muted ? 0 : lvl;
 }
 
 function setMuted(m) {
@@ -616,9 +810,9 @@ function setMuted(m) {
 
 // ===========================================================================
 // Microphone trigger: onset detection
-// Idea: track the room's normal loudness slowly ("background"). A strike fires
-// when the sound right now is several times louder than background AND above
-// a minimum floor AND it rose suddenly (claps do, voices mostly ramp up).
+// Track the room's normal loudness slowly ("background"). A strike fires when
+// the sound right now is several times louder than background AND above a
+// minimum floor AND it rose suddenly (claps do; voices mostly ramp up).
 // ===========================================================================
 const mic = { on: false, stream: null, analyser: null, buf: null, bg: 0.004, hist: [], last: -10, rms: 0, thr: 0 };
 const micBtn = document.getElementById('micBtn');
@@ -667,7 +861,7 @@ micBtn.addEventListener('click', toggleMic);
 function updateMic(now) {
   if (!mic.on) return;
   mic.analyser.getFloatTimeDomainData(mic.buf);
-  // RMS (root mean square) = the "average power" of the samples: a steady loudness number.
+  // RMS (root mean square) = the average power of the samples: a steady loudness number.
   let sum = 0;
   for (let i = 0; i < mic.buf.length; i++) sum += mic.buf[i] * mic.buf[i];
   const rms = Math.sqrt(sum / mic.buf.length);
@@ -680,17 +874,16 @@ function updateMic(now) {
   // "Sudden": compare against the level ~5 frames (~80 ms) ago.
   const before = mic.hist.length >= 5 ? mic.hist[mic.hist.length - 5] : rms;
   // Our own thunder comes out of the speakers into the mic: ignore the mic
-  // while it plays (plus 0.3 s), unless the user wears headphones.
-  const suppressed = !settings.headphones && now < audio.thunderUntil + 0.3;
+  // while it is loud, unless the user wears headphones.
+  const suppressed = !settings.headphones && thunderLevel(now) > 0.04;
 
   if (!suppressed && now - mic.last > 1.5 && rms > thr && rms > before * 2) {
     mic.last = now;
-    // Louder = bigger strike: each doubling over the threshold adds 0.3.
+    // Louder = bigger, closer strike: each doubling over the threshold adds 0.3.
     const strength = Math.min(1, 0.35 + Math.log2(rms / thr) * 0.3);
     triggerStrike(rand(0.15, 0.85), strength);
   }
-  // Learn the background only from "normal" frames, never from claps or our thunder.
-  // Rises slowly, falls faster: a quiet room is re-learned quickly.
+  // Learn the background only from normal frames, never from claps or thunder.
   if (!suppressed && rms < thr) mic.bg += (rms - mic.bg) * (rms > mic.bg ? 0.02 : 0.08);
   mic.hist.push(rms);
   if (mic.hist.length > 10) mic.hist.shift();
@@ -701,7 +894,7 @@ function updateMic(now) {
 // Level meter in decibels (-60 dB .. 0 dB) with the trigger threshold as a line.
 function drawMeter(suppressed) {
   const W = meter.width, H = meter.height;
-  const db = v => Math.max(0, Math.min(1, (20 * Math.log10(v + 1e-9) + 60) / 60));
+  const db = v => clamp((20 * Math.log10(v + 1e-9) + 60) / 60, 0, 1);
   meterCtx.clearRect(0, 0, W, H);
   meterCtx.fillStyle = suppressed ? '#555c6e' : mic.rms > mic.thr ? '#f0d36b' : '#5f8fd8';
   meterCtx.fillRect(0, 0, db(mic.rms) * W, H);
@@ -736,7 +929,7 @@ document.getElementById('mute').addEventListener('change', e => { ensureAudio();
 // ===========================================================================
 canvas.addEventListener('pointerdown', e => {
   ensureAudio();
-  triggerStrike(e.clientX / innerWidth, rand(0.65, 0.9));
+  triggerStrike(e.clientX / innerWidth, rand(0.55, 0.9));
 });
 addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') { ensureAudio(); setMuted(!audio.muted); }
@@ -761,7 +954,8 @@ function frame(now) {
   gl.uniform1f(U.uRain, settings.rain);
   gl.uniform1f(U.uCloud, settings.clouds);
   gl.uniform1f(U.uFlash, s.flash);
-  gl.uniform1f(U.uBolt, s.bolt);
+  gl.uniform1f(U.uMain, s.main);
+  gl.uniform1f(U.uBranch, s.branch);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   fpsFrames++;
