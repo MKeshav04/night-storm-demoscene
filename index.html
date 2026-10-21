@@ -39,6 +39,15 @@ uniform float uTime;    // seconds since start
 uniform float uRain;    // rain amount 0..1
 uniform float uCloud;   // cloud density 0..1
 
+// Lightning (all set from JavaScript when a strike happens)
+uniform float uFlash;      // overall sky/cloud brightness from the strike, 0..~1.5
+uniform float uBolt;       // how visible the bolt channel is right now, 0..1
+uniform vec2  uFlashPos;   // where the bolt starts inside the clouds
+uniform vec4  uSeg[64];    // bolt segments: xy = start, zw = end
+uniform float uSegB[64];   // brightness of each segment (branches are dimmer)
+uniform int   uSegCount;
+uniform vec4  uBoltBox;    // bounding box of the bolt: minX, minY, maxX, maxY
+
 const float WIND = 0.16;               // how far rain leans sideways per unit fallen
 const vec3  FLASH_COL = vec3(0.72, 0.78, 1.0); // lightning is blue-white
 
@@ -192,6 +201,38 @@ float rainLayer(vec2 p, float cols, float cellH, float speed, float seed, float 
   return across * along * (0.6 + 0.4 * hash11(di + ci));
 }
 
+// ---------------------------------------------------------------------------
+// Lightning glow.
+// segDist: shortest distance from point p to the line segment a-b. Project p
+// onto the line, clamp the projection to the segment (h in 0..1), measure.
+// ---------------------------------------------------------------------------
+float segDist(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+
+// Returns x = hot core, y = soft halo. For every segment we compute the
+// distance and keep the strongest response (max, not sum, so overlapping
+// segments at joints don't double up into bright dots).
+vec2 boltGlow(vec2 p) {
+  if (uSegCount == 0 || uBolt <= 0.001) return vec2(0.0);
+  // Cheap early exit: pixels far from the bolt's box can't get any glow.
+  const float M = 0.3;
+  if (p.x < uBoltBox.x - M || p.x > uBoltBox.z + M || p.y < uBoltBox.y - M || p.y > uBoltBox.w + M) return vec2(0.0);
+  float core = 0.0, halo = 0.0;
+  for (int i = 0; i < 64; i++) {
+    if (i >= uSegCount) break;
+    float d = segDist(p, uSeg[i].xy, uSeg[i].zw);
+    float b = uSegB[i];
+    // Gaussian core about 1px wide: exp(-d^2 / 2sigma^2) with sigma ~ 0.0011.
+    core = max(core, b * exp(-d * d * 4.0e5));
+    // Halo: an exponential "bloom" near the channel plus a long 1/(1+d^2) tail.
+    halo = max(halo, b * (0.6 * exp(-d * 70.0) + 0.3 / (1.0 + d * d * 900.0)));
+  }
+  return vec2(core, halo) * uBolt;
+}
+
 // ACES-style filmic tone curve: squeezes bright HDR values into 0..1 smoothly
 // instead of clipping, and keeps the darks dark. Coefficients are the
 // widely published Narkowicz curve fit.
@@ -218,21 +259,36 @@ void main() {
                 + townGlow * 0.9 * exp(-max(p.y - 0.2, 0.0) * 3.0);
   col = mix(col, cloudCol, cov * 0.95);
 
-  // ---- landscape ----
+  // ---- lightning lighting the sky ----
+  // Light from the strike is strongest around where the bolt leaves the
+  // cloud (uFlashPos) and spreads through the whole cloud deck more weakly.
+  // Thick cloud scatters more light back at us than the gaps between clouds.
+  float local = exp(-length((p - uFlashPos) * vec2(0.8, 1.6)) * 3.0);
+  col += FLASH_COL * uFlash * (0.12 + cov * (0.35 + 3.0 * local) * (0.4 + thick));
+
+  // ---- the bolt itself ----
+  vec2 g = boltGlow(p);
+  // Up inside the cloud base the channel is hidden by cloud, so only its glow shows.
+  float hidden = cov * smoothstep(0.6, 0.85, p.y);
+  col += vec3(1.0) * g.x * 9.0 * (1.0 - 0.85 * hidden);
+  col += FLASH_COL * g.y * (1.6 + cov * 1.5);
+
+  // ---- landscape (drawn after the bolt so hills hide its lower end) ----
   float far = farRidge(p.x);
   float near = nearRidge(p.x);
-  // Mist hugging the far hills.
-  col += vec3(0.020, 0.020, 0.026) * exp(-abs(p.y - far) * 25.0);
-  if (p.y < far) col = vec3(0.010, 0.011, 0.016);
+  // Mist hugging the far hills; the flash lights it up too.
+  col += (vec3(0.020, 0.020, 0.026) + FLASH_COL * uFlash * 0.25) * exp(-abs(p.y - far) * 25.0);
+  if (p.y < far) col = vec3(0.010, 0.011, 0.016) + FLASH_COL * uFlash * 0.05;
   col += vec3(1.0, 0.55, 0.22) * townLights(p, near, far) * 4.0;
-  if (p.y < near) col = vec3(0.003, 0.004, 0.006);
+  if (p.y < near) col = vec3(0.003, 0.004, 0.006) + FLASH_COL * uFlash * 0.012;
 
   // ---- rain (in front of everything) ----
   float amt = uRain * 0.7;
   float rain = rainLayer(p, 22.0, 0.16, 1.40, 0.0, amt)
              + rainLayer(p, 45.0, 0.10, 1.00, 3.1, amt) * 0.55
              + rainLayer(p, 90.0, 0.06, 0.70, 7.3, amt) * 0.3;
-  col += vec3(0.55, 0.6, 0.7) * rain * 0.07;
+  // Drops catch the flash: barely visible normally, bright streaks during a strike.
+  col += vec3(0.55, 0.6, 0.7) * rain * (0.07 + 1.2 * uFlash);
   col += vec3(0.010, 0.011, 0.014) * uRain;          // overall wet haze
 
   // ---- finishing ----
@@ -281,7 +337,8 @@ gl.useProgram(prog);
 gl.bindVertexArray(gl.createVertexArray()); // empty VAO: the vertex shader makes its own positions
 
 const U = {};
-for (const name of ['uRes', 'uTime', 'uRain', 'uCloud']) U[name] = gl.getUniformLocation(prog, name);
+for (const name of ['uRes', 'uTime', 'uRain', 'uCloud', 'uFlash', 'uBolt', 'uFlashPos',
+                    'uSeg', 'uSegB', 'uSegCount', 'uBoltBox']) U[name] = gl.getUniformLocation(prog, name);
 
 // Render at (CSS size × device pixel ratio × render scale); the browser
 // stretches the canvas back up to full screen. Lower scale = fewer pixels to shade.
@@ -299,6 +356,232 @@ addEventListener('resize', resize);
 resize();
 
 // ===========================================================================
+// Bolt generator (runs on the CPU once per strike)
+// Coordinates match the shader: y 0..1 bottom to top, x 0..aspect.
+// ===========================================================================
+const MAX_SEGS = 64;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// Midpoint displacement: take a straight line, push its midpoint sideways by a
+// random amount, then do the same to the two halves with half the push, and so
+// on. Big zig-zags first, smaller and smaller kinks after: a jagged channel.
+function displace(ax, ay, bx, by, levels, jitter) {
+  let pts = [[ax, ay], [bx, by]];
+  for (let lvl = 0; lvl < levels; lvl++) {
+    const next = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+      const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+      const off = rand(-1, 1) * jitter;
+      // (-dy, dx)/len is the direction perpendicular to the segment.
+      next.push([(x1 + x2) / 2 - dy / len * off, (y1 + y2) / 2 + dx / len * off], pts[i + 1]);
+    }
+    pts = next;
+    jitter *= 0.5;
+  }
+  return pts;
+}
+
+function makeBolt(targetX, strength) {
+  const segs = []; // [ax, ay, bx, by, brightness]
+  const sx = targetX + rand(-0.18, 0.18), sy = rand(0.86, 0.95);
+  // End below the horizon: the hills drawn in front hide where it really lands.
+  const main = displace(sx, sy, targetX + rand(-0.02, 0.02), 0.05, 5, 0.11); // 2^5 = 32 segments
+  for (let i = 0; i < main.length - 1; i++) segs.push([...main[i], ...main[i + 1], 1.0]);
+
+  // Branches: start from a random point on the upper part of the main channel,
+  // fork off sideways and downward, dimmer and fading toward their tips.
+  const branches = Math.round(1 + strength * 3);
+  for (let b = 0; b < branches && segs.length + 8 <= MAX_SEGS; b++) {
+    const [x0, y0] = main[Math.floor(rand(2, main.length * 0.6))];
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const ang = side * rand(0.35, 0.9);           // radians away from straight down
+    const len = rand(0.08, 0.25) * (0.6 + strength * 0.6);
+    const pts = displace(x0, y0, x0 + Math.sin(ang) * len, y0 - Math.cos(ang) * len, 3, 0.04);
+    const base = rand(0.35, 0.6);
+    for (let i = 0; i < pts.length - 1; i++)
+      segs.push([...pts[i], ...pts[i + 1], base * (1 - i / (pts.length - 1)) + 0.05]);
+  }
+  return segs;
+}
+
+// ===========================================================================
+// Strike manager: flicker envelope + uploading the bolt to the shader
+// ===========================================================================
+const segData = new Float32Array(MAX_SEGS * 4);
+const segBright = new Float32Array(MAX_SEGS);
+const strike = { active: false, start: 0, pulses: [], strength: 0, end: 0 };
+
+function triggerStrike(xFrac, strength) {
+  const aspect = canvas.width / canvas.height;
+  const x = xFrac * aspect;
+  const segs = makeBolt(x, strength);
+
+  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  segData.fill(0); segBright.fill(0);
+  segs.forEach((s, i) => {
+    segData.set(s.slice(0, 4), i * 4);
+    segBright[i] = s[4];
+    minX = Math.min(minX, s[0], s[2]); maxX = Math.max(maxX, s[0], s[2]);
+    minY = Math.min(minY, s[1], s[3]); maxY = Math.max(maxY, s[1], s[3]);
+  });
+  gl.uniform4fv(U.uSeg, segData);
+  gl.uniform1fv(U.uSegB, segBright);
+  gl.uniform1i(U.uSegCount, segs.length);
+  gl.uniform4f(U.uBoltBox, minX, minY, maxX, maxY);
+  gl.uniform2f(U.uFlashPos, segs[0][0], segs[0][1] - 0.05);
+
+  // Real lightning flickers: the channel re-fires 2-4 times along the same
+  // path within half a second. Each pulse jumps up instantly, decays fast.
+  const now = performance.now() / 1000;
+  const pulses = [{ t: 0, a: 1, tau: 0.07 }];
+  let t = 0;
+  const n = 1 + Math.floor(rand(1, 4));
+  for (let i = 0; i < n; i++) {
+    t += rand(0.05, 0.17);
+    pulses.push({ t, a: rand(0.45, 1.0), tau: rand(0.04, 0.09) });
+  }
+  pulses.push({ t: 0, a: 0.22, tau: 0.4 }); // slow afterglow in the clouds
+  Object.assign(strike, { active: true, start: now, pulses, strength, end: t + 1.8 });
+
+  playThunder(strength);
+  document.getElementById('hint')?.classList.add('gone');
+}
+
+function updateStrike(now) {
+  if (!strike.active) return { flash: 0, bolt: 0 };
+  const t = now - strike.start;
+  if (t > strike.end) { strike.active = false; gl.uniform1i(U.uSegCount, 0); return { flash: 0, bolt: 0 }; }
+  let env = 0;
+  for (const p of strike.pulses) if (t >= p.t) env += p.a * Math.exp(-(t - p.t) / p.tau);
+  return {
+    flash: Math.min(1.6, env * (0.5 + strike.strength * 0.8)),
+    bolt: Math.min(1, env * 1.6) * (0.6 + strike.strength * 0.4),
+  };
+}
+
+// ===========================================================================
+// Audio: synthesized thunder + a steady medium rain bed. No sound files.
+// Browsers only allow audio after a user gesture, so this starts on the
+// first click or key press.
+// ===========================================================================
+const audio = { ctx: null, master: null, white: null, brown: null, rainGain: null, thunderUntil: 0, muted: false };
+
+function noiseBuffer(ctx, seconds, brown) {
+  const buf = ctx.createBuffer(1, ctx.sampleRate * seconds, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < d.length; i++) {
+    const w = Math.random() * 2 - 1;
+    // Brown noise = running sum of white noise (leaky so it doesn't drift).
+    // It's heavy in low frequencies: the natural base for a rumble.
+    if (brown) { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w;
+  }
+  return buf;
+}
+
+function ensureAudio() {
+  if (audio.ctx) { if (audio.ctx.state === 'suspended') audio.ctx.resume(); return; }
+  const ctx = new AudioContext();
+  audio.ctx = ctx;
+  // master gain (mute) -> compressor (stops loud strikes from clipping) -> speakers
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -12; comp.ratio.value = 4;
+  audio.master = ctx.createGain();
+  audio.master.gain.value = audio.muted ? 0 : 1;
+  audio.master.connect(comp).connect(ctx.destination);
+  audio.white = noiseBuffer(ctx, 4, false);
+  audio.brown = noiseBuffer(ctx, 8, true);
+
+  // Rain bed: looping white noise band-limited to the "hiss" range of rain
+  // hitting the ground, plus a quieter low layer for body.
+  const src = ctx.createBufferSource();
+  src.buffer = audio.white; src.loop = true;
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 600;
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 6500;
+  const body = ctx.createBiquadFilter(); body.type = 'lowpass'; body.frequency.value = 500;
+  const bodyGain = ctx.createGain(); bodyGain.gain.value = 0.5;
+  audio.rainGain = ctx.createGain();
+  audio.rainGain.gain.value = 0;
+  src.connect(hp).connect(lp).connect(audio.rainGain);
+  src.connect(body).connect(bodyGain).connect(audio.rainGain);
+  audio.rainGain.connect(audio.master);
+  src.start();
+}
+
+function updateRainSound(t) {
+  if (!audio.ctx) return;
+  // Volume follows the rain slider, with a slow gentle swell so it feels alive.
+  const target = settings.rain * 0.09 * (0.88 + 0.12 * Math.sin(t * 0.37) * Math.sin(t * 0.11));
+  audio.rainGain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.3);
+}
+
+function playThunder(strength) {
+  ensureAudio();
+  const ctx = audio.ctx;
+  // Distance in km. Stronger strikes tend to be closer. Sound travels ~1 km in 3 s.
+  const dist = 0.1 + Math.pow(Math.random(), 1.5) * 1.6 * (1.2 - strength * 0.5);
+  const t0 = ctx.currentTime + dist * 3;
+  const close = dist < 0.6;
+  const dur = rand(3, 4) + Math.min(dist, 1.5) * 1.3;   // ~3-6 s
+  const loud = Math.max(0.15, Math.min(1, strength * (1.15 - dist * 0.35)));
+
+  // Rumble: brown noise -> two lowpass filters. Closer = brighter (higher cutoff).
+  const src = ctx.createBufferSource(); src.buffer = audio.brown;
+  const lp1 = ctx.createBiquadFilter(); lp1.type = 'lowpass';
+  const lp2 = ctx.createBiquadFilter(); lp2.type = 'lowpass'; lp2.frequency.value = 400;
+  lp1.frequency.setValueAtTime(close ? 420 : rand(140, 260), t0);
+  lp1.frequency.setTargetAtTime(90, t0 + 0.3, dur * 0.35);   // high end dies first as it rolls away
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t0);
+  const attack = close ? 0.03 : rand(0.25, 0.5);
+  g.gain.linearRampToValueAtTime(loud * (close ? 1 : 0.75), t0 + attack);
+  // "Rolling": jump between random levels every 0.12-0.45 s under a decaying curve.
+  for (let t = t0 + attack; t < t0 + dur;) {
+    t += rand(0.12, 0.45);
+    const left = Math.max(0, 1 - (t - t0) / dur);
+    g.gain.linearRampToValueAtTime(loud * Math.pow(left, 1.5) * rand(0.35, 1), Math.min(t, t0 + dur));
+  }
+  g.gain.linearRampToValueAtTime(0, t0 + dur + 0.3);
+  src.connect(lp1).connect(lp2).connect(g).connect(audio.master);
+  src.start(t0, rand(0, 2));
+  src.stop(t0 + dur + 0.5);
+
+  // Close strike: a sharp crack first (short burst of high-passed noise).
+  if (close) {
+    const c = ctx.createBufferSource(); c.buffer = audio.white;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1200;
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(0, t0);
+    cg.gain.linearRampToValueAtTime(loud * 0.9, t0 + 0.005);
+    cg.gain.exponentialRampToValueAtTime(0.001, t0 + rand(0.2, 0.35));
+    c.connect(hp).connect(cg).connect(audio.master);
+    c.start(t0, rand(0, 3));
+    c.stop(t0 + 0.4);
+  }
+  // Remember (in performance.now() seconds) when this thunder ends,
+  // so the mic can ignore our own speakers until then.
+  const endPerf = performance.now() / 1000 + (t0 + dur + 0.3 - ctx.currentTime);
+  audio.thunderUntil = Math.max(audio.thunderUntil, endPerf);
+}
+
+function setMuted(m) {
+  audio.muted = m;
+  if (audio.ctx) audio.master.gain.setTargetAtTime(m ? 0 : 1, audio.ctx.currentTime, 0.05);
+}
+
+// ===========================================================================
+// Input
+// ===========================================================================
+canvas.addEventListener('pointerdown', e => {
+  ensureAudio();
+  triggerStrike(e.clientX / innerWidth, rand(0.65, 0.9));
+});
+addEventListener('keydown', e => {
+  if (e.key === 'm' || e.key === 'M') { ensureAudio(); setMuted(!audio.muted); }
+});
+
+// ===========================================================================
 // Render loop
 // ===========================================================================
 const fpsEl = document.getElementById('fps');
@@ -307,11 +590,15 @@ const t0 = performance.now();
 
 function frame(now) {
   const t = (now - t0) / 1000;
+  const s = updateStrike(now / 1000);
+  updateRainSound(t);
 
   gl.uniform2f(U.uRes, canvas.width, canvas.height);
   gl.uniform1f(U.uTime, t);
   gl.uniform1f(U.uRain, settings.rain);
   gl.uniform1f(U.uCloud, settings.clouds);
+  gl.uniform1f(U.uFlash, s.flash);
+  gl.uniform1f(U.uBolt, s.bolt);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   fpsFrames++;
