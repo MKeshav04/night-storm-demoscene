@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Night Storm</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 13px/1.4 system-ui, sans-serif; color: #c9d1e0; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; }
+  #fps { position: fixed; top: 8px; left: 10px; opacity: .45; font-variant-numeric: tabular-nums; pointer-events: none; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; text-align: center; padding: 24px; background: #000; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="fps"></div>
+<div id="err"></div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+// One triangle that covers the whole screen. No vertex buffer needed:
+// gl_VertexID 0,1,2 -> (0,0), (2,0), (0,2) in 0..2 space -> clip space -1..3.
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+precision highp int;
+out vec4 outColor;
+
+// Coordinate system used everywhere below:
+//   p.y goes 0 (bottom) .. 1 (top), p.x goes 0 .. aspect (width/height).
+// Using the height as the unit keeps shapes round on any screen size.
+
+uniform vec2  uRes;     // canvas size in pixels
+uniform float uTime;    // seconds since start
+uniform float uRain;    // rain amount 0..1
+uniform float uCloud;   // cloud density 0..1
+
+const float WIND = 0.16;               // how far rain leans sideways per unit fallen
+const vec3  FLASH_COL = vec3(0.72, 0.78, 1.0); // lightning is blue-white
+
+// ---------------------------------------------------------------------------
+// Hashing: turn integer grid coordinates into repeatable pseudo-random numbers.
+// mixBits scrambles the bits of a 32-bit integer with xor-shifts and odd
+// multipliers, so neighbouring inputs give unrelated outputs.
+// ---------------------------------------------------------------------------
+uint mixBits(uint x) {
+  x ^= x >> 16; x *= 0x7feb352du;
+  x ^= x >> 15; x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+// +65536 keeps the ints positive so int->uint is always well defined.
+float hash11(float n) {
+  return float(mixBits(uint(int(n) + 65536)) >> 8) / 16777215.0;
+}
+float hash21(vec2 c) {
+  uint h = mixBits(uint(int(c.x) + 65536) ^ mixBits(uint(int(c.y) + 65536)));
+  return float(h >> 8) / 16777215.0;
+}
+
+// Value noise: random values on the corners of a grid cell, blended smoothly
+// across the cell. The f*f*(3-2f) curve has zero slope at the cell edges, so
+// there are no visible creases between cells.
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// fbm (fractal Brownian motion): add several noise layers ("octaves"), each at
+// double the frequency and half the strength of the previous one. Big soft
+// shapes + smaller and smaller detail = something that looks like cloud.
+// Rotating between octaves hides the grid alignment of the value noise.
+float fbm(vec2 p, int octaves) {
+  const mat2 R = mat2(0.8, -0.6, 0.6, 0.8);
+  float sum = 0.0, amp = 0.5, norm = 0.0;
+  for (int i = 0; i < 5; i++) {
+    if (i >= octaves) break;
+    sum += amp * vnoise(p);
+    norm += amp;
+    p = R * p * 2.03 + 17.1;
+    amp *= 0.5;
+  }
+  return sum / norm; // back to roughly 0..1
+}
+
+// ---------------------------------------------------------------------------
+// Clouds. Returns x = coverage (0 clear sky .. 1 solid cloud), y = raw noise
+// value, which we reuse as "thickness" for shading.
+// ---------------------------------------------------------------------------
+vec2 clouds(vec2 p) {
+  // Squash vertically: storm clouds are wide, flat-bottomed layers.
+  vec2 q = vec2(p.x * 1.1, p.y * 2.4) + vec2(uTime * 0.015, 0.0);
+  // Domain warp: offset the lookup by another noise so edges billow
+  // instead of looking like plain blurry blobs.
+  float warp = fbm(q * 0.7 + vec2(0.0, uTime * 0.008), 3);
+  float n = fbm(q * 1.6 + warp * 1.4 + vec2(uTime * 0.01, 0.0), 5);
+  // More cloud higher up, density slider shifts everything.
+  float height = smoothstep(0.15, 0.9, p.y);
+  float cover = n + (height - 0.5) * 0.35 + (uCloud - 0.5) * 0.6;
+  return vec2(smoothstep(0.38, 0.72, cover), n);
+}
+
+// Tiny stars, only seen through gaps in the clouds.
+float stars(vec2 p) {
+  vec2 g = p * 160.0;
+  vec2 cell = floor(g);
+  float r = hash21(cell);
+  if (r > 0.06) return 0.0;                         // ~6% of cells get a star
+  vec2 pos = vec2(hash21(cell + 3.1), hash21(cell + 7.7)) - 0.5;
+  float d = length(fract(g) - 0.5 - pos * 0.7);
+  float twinkle = 0.6 + 0.4 * sin(uTime * (1.0 + r * 30.0) + r * 100.0);
+  return smoothstep(0.12, 0.0, d) * twinkle * (0.3 + r * 8.0);
+}
+
+// ---------------------------------------------------------------------------
+// Landscape: two ridge lines made of 1D noise (noise sampled along x only).
+// ---------------------------------------------------------------------------
+// y = 0 so we read one row of the grid (y = 0.5 would average two rows and
+// flatten the result toward 0.5).
+float noise1(float x) { return vnoise(vec2(x, 0.0)); }
+
+float farRidge(float x) {
+  return 0.18 + 0.10 * (noise1(x * 2.2 + 3.0) * 0.6 + noise1(x * 6.0 + 1.0) * 0.3 + noise1(x * 17.0) * 0.1);
+}
+
+// Conifer silhouettes: split x into slots, some slots get a triangle "tree".
+float trees(float x) {
+  float g = x * 30.0;
+  float cell = floor(g);
+  float r = hash11(cell);
+  float clump = smoothstep(0.2, 0.4, noise1(x * 2.5 + 11.0)); // trees grow in clumps
+  if (r > 0.75 * clump) return 0.0;
+  float lx = fract(g) - 0.5 - (hash11(cell + 71.0) - 0.5) * 0.24;
+  float h = 0.018 + 0.03 * hash11(cell + 13.0);
+  float t = 1.0 - abs(lx) / 0.36;                  // triangle profile
+  t *= 0.85 + 0.15 * step(0.5, fract(t * 4.0));    // little tiers of branches
+  return max(0.0, h * t);
+}
+
+float nearRidge(float x) {
+  return 0.07 + 0.09 * noise1(x * 1.4 + 40.0) + 0.02 * noise1(x * 8.0) + trees(x);
+}
+
+// Warm, slightly flickering town lights on the far hills.
+float townLights(vec2 p, float near, float far) {
+  if (p.y > far - 0.004 || p.y < near) return 0.0;
+  float town = smoothstep(0.55, 0.75, noise1(p.x * 1.3 + 5.0));
+  if (town <= 0.0) return 0.0;
+  vec2 g = p * vec2(140.0, 260.0);
+  vec2 cell = floor(g);
+  float r = hash21(cell + 50.0);
+  if (r > 0.12) return 0.0;
+  vec2 pos = vec2(hash21(cell + 1.3), hash21(cell + 2.9)) - 0.5;
+  vec2 d = (fract(g) - 0.5 - pos * 0.6) / vec2(140.0, 260.0);   // back to uv units
+  float flicker = 0.85 + 0.15 * sin(uTime * 3.0 + r * 60.0);   // rain shimmering in front
+  return town * exp(-dot(d, d) / 1.6e-6) * flicker * (0.4 + r * 3.0);
+}
+
+// ---------------------------------------------------------------------------
+// Rain: one layer of streaks. The screen is cut into vertical columns; each
+// column is cut into cells along y. A cell holds at most one drop. Scrolling
+// the y lookup by time makes the drops fall; skewing x by y makes them lean.
+//   cols   = columns across one screen height (more = smaller, farther)
+//   cellH  = cell height in screen units (controls spacing + streak length)
+//   speed  = fall speed in screen heights per second
+// ---------------------------------------------------------------------------
+float rainLayer(vec2 p, float cols, float cellH, float speed, float seed, float amount) {
+  p.x += p.y * WIND + seed;
+  float x = p.x * cols;
+  float ci = floor(x);
+  float colRnd = hash21(vec2(ci, seed * 31.0));
+  // Each column falls at a slightly different speed so rows don't line up.
+  float y = p.y / cellH + uTime * speed / cellH * (0.85 + 0.3 * colRnd) + colRnd * 50.0;
+  float di = floor(y);
+  float f = fract(y);                        // 0 = bottom of cell, 1 = top
+  float dropRnd = hash21(vec2(ci + seed * 7.0, di));
+  if (dropRnd > amount) return 0.0;          // this cell is empty
+  float xo = (hash21(vec2(di, ci + seed * 3.0)) - 0.5) * 0.5;
+  float dx = abs(fract(x) - 0.5 - xo);
+  float across = 1.0 - smoothstep(0.0, 0.07, dx);
+  // The head of the drop is the lowest point (it's falling), the tail fades upward.
+  float along = smoothstep(0.0, 0.05, f) * (1.0 - smoothstep(0.0, 0.55, f));
+  return across * along * (0.6 + 0.4 * hash11(di + ci));
+}
+
+// ACES-style filmic tone curve: squeezes bright HDR values into 0..1 smoothly
+// instead of clipping, and keeps the darks dark. Coefficients are the
+// widely published Narkowicz curve fit.
+vec3 toneMap(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+  vec2 p = frag / uRes.y;                // height-normalised coordinates
+  vec2 uv = frag / uRes;                 // 0..1 in both axes (for vignette)
+
+  // ---- sky ----
+  vec3 col = mix(vec3(0.020, 0.024, 0.036), vec3(0.006, 0.008, 0.016), p.y);
+  vec3 townGlow = vec3(0.045, 0.022, 0.010);         // orange light pollution
+  col += townGlow * exp(-max(p.y - 0.15, 0.0) * 6.0);
+
+  vec2 cl = clouds(p);
+  float cov = cl.x, thick = cl.y;
+  col += vec3(0.8, 0.85, 1.0) * stars(p) * 0.05 * pow(1.0 - cov, 3.0);
+
+  // Cloud colour: dim blue-grey, underside tinted by the town glow.
+  vec3 cloudCol = vec3(0.028, 0.031, 0.040) * (0.55 + 0.9 * thick)
+                + townGlow * 0.9 * exp(-max(p.y - 0.2, 0.0) * 3.0);
+  col = mix(col, cloudCol, cov * 0.95);
+
+  // ---- landscape ----
+  float far = farRidge(p.x);
+  float near = nearRidge(p.x);
+  // Mist hugging the far hills.
+  col += vec3(0.020, 0.020, 0.026) * exp(-abs(p.y - far) * 25.0);
+  if (p.y < far) col = vec3(0.010, 0.011, 0.016);
+  col += vec3(1.0, 0.55, 0.22) * townLights(p, near, far) * 4.0;
+  if (p.y < near) col = vec3(0.003, 0.004, 0.006);
+
+  // ---- rain (in front of everything) ----
+  float amt = uRain * 0.7;
+  float rain = rainLayer(p, 22.0, 0.16, 1.40, 0.0, amt)
+             + rainLayer(p, 45.0, 0.10, 1.00, 3.1, amt) * 0.55
+             + rainLayer(p, 90.0, 0.06, 0.70, 7.3, amt) * 0.3;
+  col += vec3(0.55, 0.6, 0.7) * rain * 0.07;
+  col += vec3(0.010, 0.011, 0.014) * uRain;          // overall wet haze
+
+  // ---- finishing ----
+  col = toneMap(col * 0.6);                                 // 0.6 = exposure
+  col *= 1.0 - 0.45 * pow(length(uv - 0.5) * 1.15, 2.2);   // vignette
+  col = pow(col, vec3(1.0 / 2.2));                          // linear -> screen gamma
+  col += (hash21(frag + fract(uTime) * 1000.0) - 0.5) * 0.012; // film grain (also hides banding)
+  outColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+'use strict';
+// ===========================================================================
+// Settings (the panel edits these later)
+// ===========================================================================
+const settings = { rain: 0.55, clouds: 0.65, scale: 0.75 };
+
+// ===========================================================================
+// WebGL2 setup
+// ===========================================================================
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+
+function fail(msg) {
+  const e = document.getElementById('err');
+  e.textContent = msg;
+  e.style.display = 'grid';
+  throw new Error(msg);
+}
+if (!gl) fail('Your browser or GPU does not support WebGL2. Try the latest Chrome or Edge.');
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src.trim());
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail('Shader error:\n' + gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fail('Link error:\n' + gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray()); // empty VAO: the vertex shader makes its own positions
+
+const U = {};
+for (const name of ['uRes', 'uTime', 'uRain', 'uCloud']) U[name] = gl.getUniformLocation(prog, name);
+
+// Render at (CSS size × device pixel ratio × render scale); the browser
+// stretches the canvas back up to full screen. Lower scale = fewer pixels to shade.
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const w = Math.max(1, Math.floor(innerWidth * dpr * settings.scale));
+  const h = Math.max(1, Math.floor(innerHeight * dpr * settings.scale));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+addEventListener('resize', resize);
+resize();
+
+// ===========================================================================
+// Render loop
+// ===========================================================================
+const fpsEl = document.getElementById('fps');
+let fpsFrames = 0, fpsLast = performance.now();
+const t0 = performance.now();
+
+function frame(now) {
+  const t = (now - t0) / 1000;
+
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform1f(U.uRain, settings.rain);
+  gl.uniform1f(U.uCloud, settings.clouds);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  fpsFrames++;
+  if (now - fpsLast > 500) {
+    fpsEl.textContent = Math.round(fpsFrames * 1000 / (now - fpsLast)) + ' fps · ' + canvas.width + '×' + canvas.height;
+    fpsFrames = 0;
+    fpsLast = now;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
