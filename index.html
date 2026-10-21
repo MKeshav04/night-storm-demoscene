@@ -999,8 +999,15 @@ function setMuted(m) {
 //      (A clap has a few quick sub-bursts and a short ring, so we don't
 //      demand a single clean spike.) A voice never falls back that fast.
 // Strike when that hit is well above the room's usual level.
+//
+// Second path, for everything else (a word, a shout, a whistle, a bang):
+// listen to the full voice range (above 150 Hz) and strike when the loudness
+// over the last ~21 ms jumps well above the room's normal level AND well above
+// what it was ~0.1-0.2 s ago (a sudden sound, not a steady one). This path
+// waits a little longer between strikes so non-stop talking isn't a strobe.
 // ===========================================================================
-const mic = { on: false, stream: null, analyser: null, buf: null, env: null, bgPeak: 0.01, last: -10, peak: 0, thr: 0 };
+const mic = { on: false, stream: null, analyser: null, buf: null, env: null, bgPeak: 0.01, last: -10, peak: 0, thr: 0,
+              voice: null, vbuf: null, bgRms: 0.003, rmsHist: [], rms: 0, thrL: 0 };
 const micBtn = document.getElementById('micBtn');
 const micMsg = document.getElementById('micMsg');
 const meter = document.getElementById('meter');
@@ -1054,10 +1061,18 @@ async function toggleMic() {
   const silent = audio.ctx.createGain();
   silent.gain.value = 0;
   mic.analyser.connect(silent).connect(audio.ctx.destination);
-  Object.assign(mic, { on: true, bgPeak: 0.01, last: -10 });
+  // Voice/loud-sound path: only cut the deep rumble (fans, desk, our thunder).
+  const hpV = audio.ctx.createBiquadFilter();
+  hpV.type = 'highpass'; hpV.frequency.value = 150;
+  mic.voice = audio.ctx.createAnalyser();
+  mic.voice.fftSize = 1024;                  // ~21 ms: the loudness "right now"
+  mic.vbuf = new Float32Array(mic.voice.fftSize);
+  src.connect(hpV).connect(mic.voice);
+  mic.voice.connect(silent);
+  Object.assign(mic, { on: true, bgPeak: 0.01, bgRms: 0.003, rmsHist: [], last: -10 });
   micBtn.textContent = 'Disable mic';
   meter.style.display = 'block';
-  micMsg.textContent = 'Listening. Clap, snap or knock on the desk.';
+  micMsg.textContent = 'Listening. Clap, knock, or say something loud.';
 }
 micBtn.addEventListener('click', toggleMic);
 
@@ -1099,30 +1114,49 @@ function updateMic(now) {
   const K = 2 + (10 - s) * 0.7;               // 8.3x (deaf) .. 2x (twitchy)
   const floor = 0.004 * (11 - s);             // 0.04 .. 0.004
   const thr = Math.max(mic.bgPeak * K, floor);
+  // Loud-sound path: RMS (average power) of the last ~21 ms, voice range.
+  mic.voice.getFloatTimeDomainData(mic.vbuf);
+  let sum = 0;
+  for (let i = 0; i < mic.vbuf.length; i++) sum += mic.vbuf[i] * mic.vbuf[i];
+  const rms = Math.sqrt(sum / mic.vbuf.length);
+  const KL = 2.5 + (10 - s) * 0.6;            // 7.9x (deaf) .. 2.5x (twitchy) above the room
+  const floorL = 0.003 * (11 - s);            // 0.03 .. 0.003
+  const thrL = Math.max(mic.bgRms * KL, floorL);
+  // "Sudden": the quietest moment ~0.1-0.2 s ago was much quieter than now.
+  const past = mic.rmsHist.length >= 12 ? Math.min(...mic.rmsHist.slice(0, 6)) : rms;
+  const loud = rms > thrL && rms > past * 2.5;
+
   // Our own thunder comes out of the speakers into the mic: ignore the mic
   // while it is loud, unless the user wears headphones.
   const suppressed = !settings.headphones && thunderLevel(now) > 0.04;
 
-  if (!suppressed && now - mic.last > 1.2 && peak > thr && percussive) {
-    mic.last = now;
-    // Louder = bigger, closer strike: each doubling over the threshold adds 0.25.
-    triggerStrike(rand(0.15, 0.85), Math.min(1, 0.3 + Math.log2(peak / thr) * 0.25));
+  // Louder = bigger, closer strike: each doubling over the threshold adds 0.25.
+  const fire = ratio => { mic.last = now; triggerStrike(rand(0.15, 0.85), Math.min(1, 0.3 + Math.log2(ratio) * 0.25)); };
+  if (!suppressed) {
+    if (percussive && peak > thr && now - mic.last > 1.2) fire(peak / thr);
+    else if (loud && now - mic.last > 2.0) fire(rms / thrL);
   }
-  // Learn the room's usual peaks only from normal frames, never from claps or thunder.
+  // Learn the room's usual levels only from normal frames, never from claps,
+  // shouts or our own thunder.
   if (!suppressed && peak < thr) mic.bgPeak += (peak - mic.bgPeak) * (peak > mic.bgPeak ? 0.01 : 0.05);
-  mic.peak = peak; mic.thr = thr;
+  if (!suppressed && rms < thrL) mic.bgRms += (rms - mic.bgRms) * (rms > mic.bgRms ? 0.01 : 0.05);
+  mic.rmsHist.push(rms);
+  if (mic.rmsHist.length > 12) mic.rmsHist.shift();
+  mic.peak = peak; mic.thr = thr; mic.rms = rms; mic.thrL = thrL;
   drawMeter(suppressed);
 }
 
-// Peak meter in decibels (-60 dB .. 0 dB) with the trigger threshold as a line.
+// "How close to triggering" meter: the bar is whichever path (clap or loud
+// sound) is nearer its threshold. Crossing the red line = lightning.
 function drawMeter(suppressed) {
   const W = meter.width, H = meter.height;
-  const db = v => clamp((20 * Math.log10(v + 1e-9) + 60) / 60, 0, 1);
+  const level = Math.max(mic.peak / mic.thr, mic.rms / mic.thrL);   // 1 = exactly at threshold
+  const pos = v => clamp((Math.log2(v + 1e-9) + 3) / 4.5, 0, 1);   // 1/8x .. ~2.8x across the bar
   meterCtx.clearRect(0, 0, W, H);
-  meterCtx.fillStyle = suppressed ? '#555c6e' : mic.peak > mic.thr ? '#f0d36b' : '#5f8fd8';
-  meterCtx.fillRect(0, 0, db(mic.peak) * W, H);
+  meterCtx.fillStyle = suppressed ? '#555c6e' : level > 1 ? '#f0d36b' : '#5f8fd8';
+  meterCtx.fillRect(0, 0, pos(level) * W, H);
   meterCtx.fillStyle = '#ff6b6b';
-  meterCtx.fillRect(Math.round(db(mic.thr) * W) - 1, 0, 2, H);
+  meterCtx.fillRect(Math.round(pos(1) * W) - 1, 0, 2, H);
 }
 
 // ===========================================================================
