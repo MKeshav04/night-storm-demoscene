@@ -9,11 +9,49 @@
   canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; }
   #fps { position: fixed; top: 8px; left: 10px; opacity: .45; font-variant-numeric: tabular-nums; pointer-events: none; }
   #err { position: fixed; inset: 0; display: none; place-items: center; text-align: center; padding: 24px; background: #000; }
+  .box { position: fixed; background: rgba(10, 12, 20, .72); border: 1px solid rgba(160, 175, 210, .18); border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
+  #hud { left: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; max-width: min(320px, calc(100vw - 48px)); }
+  #hud button { font: inherit; color: inherit; background: #1d2538; border: 1px solid #3a4560; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  #hud button:hover { background: #26304a; }
+  #meter { width: 200px; height: 10px; border-radius: 3px; background: #0b0e16; display: none; }
+  #micMsg { font-size: 12px; opacity: .8; }
+  #micMsg:empty { display: none; }
+  #panel { right: 12px; top: 12px; width: 240px; display: none; }
+  #panel.open { display: block; }
+  #panel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  #panel label { display: block; margin: 8px 0 2px; font-size: 12px; }
+  #panel input[type=range] { width: 100%; }
+  #panel .row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
+  #hint { left: 50%; top: 18%; transform: translateX(-50%); text-align: center; pointer-events: none; transition: opacity 1.2s; opacity: .85; }
+  #hint.gone { opacity: 0; }
+  #hint b { font-weight: 500; font-size: 16px; letter-spacing: .02em; }
+  #hint small { display: block; opacity: .6; margin-top: 4px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="fps"></div>
+<div id="hint" class="box"><b>Click or clap to summon lightning</b><small>H settings · M mute</small></div>
+
+<div id="hud" class="box">
+  <button id="micBtn">Enable mic</button>
+  <canvas id="meter" width="200" height="10" title="Mic level. The line is the trigger threshold."></canvas>
+  <div id="micMsg"></div>
+</div>
+
+<div id="panel" class="box">
+  <h3>Settings</h3>
+  <label>Mic sensitivity <span id="vSens"></span></label>
+  <input id="sens" type="range" min="1" max="10" step="1">
+  <label>Rain amount <span id="vRain"></span></label>
+  <input id="rain" type="range" min="0" max="1" step="0.05">
+  <label>Cloud density <span id="vClouds"></span></label>
+  <input id="clouds" type="range" min="0" max="1" step="0.05">
+  <label>Render scale <span id="vScale"></span></label>
+  <input id="scale" type="range" min="0.5" max="1" step="0.05">
+  <div class="row"><input id="headphones" type="checkbox"><label for="headphones" style="margin:0">Headphones mode</label></div>
+  <div class="row"><input id="mute" type="checkbox"><label for="mute" style="margin:0">Mute (M)</label></div>
+</div>
 <div id="err"></div>
 
 <script id="vs" type="x-shader/x-vertex">#version 300 es
@@ -305,7 +343,7 @@ void main() {
 // ===========================================================================
 // Settings (the panel edits these later)
 // ===========================================================================
-const settings = { rain: 0.55, clouds: 0.65, scale: 0.75 };
+const settings = { sensitivity: 5, rain: 0.55, clouds: 0.65, scale: 0.75, headphones: false };
 
 // ===========================================================================
 // WebGL2 setup
@@ -441,7 +479,7 @@ function triggerStrike(xFrac, strength) {
     t += rand(0.05, 0.17);
     pulses.push({ t, a: rand(0.45, 1.0), tau: rand(0.04, 0.09) });
   }
-  pulses.push({ t: 0, a: 0.22, tau: 0.4 }); // slow afterglow in the clouds
+  pulses.push({ t: 0, a: 0.22, tau: 0.4, cloudOnly: true }); // slow afterglow in the clouds
   Object.assign(strike, { active: true, start: now, pulses, strength, end: t + 1.8 });
 
   playThunder(strength);
@@ -452,11 +490,16 @@ function updateStrike(now) {
   if (!strike.active) return { flash: 0, bolt: 0 };
   const t = now - strike.start;
   if (t > strike.end) { strike.active = false; gl.uniform1i(U.uSegCount, 0); return { flash: 0, bolt: 0 }; }
-  let env = 0;
-  for (const p of strike.pulses) if (t >= p.t) env += p.a * Math.exp(-(t - p.t) / p.tau);
+  let env = 0, channel = 0;
+  for (const p of strike.pulses) {
+    if (t < p.t) continue;
+    const v = p.a * Math.exp(-(t - p.t) / p.tau);
+    env += v;
+    if (!p.cloudOnly) channel += v;   // the bolt itself only follows the fast pulses
+  }
   return {
     flash: Math.min(1.6, env * (0.5 + strike.strength * 0.8)),
-    bolt: Math.min(1, env * 1.6) * (0.6 + strike.strength * 0.4),
+    bolt: Math.min(1, channel * 1.6) * (0.6 + strike.strength * 0.4),
   };
 }
 
@@ -567,8 +610,126 @@ function playThunder(strength) {
 
 function setMuted(m) {
   audio.muted = m;
+  document.getElementById('mute').checked = m;
   if (audio.ctx) audio.master.gain.setTargetAtTime(m ? 0 : 1, audio.ctx.currentTime, 0.05);
 }
+
+// ===========================================================================
+// Microphone trigger: onset detection
+// Idea: track the room's normal loudness slowly ("background"). A strike fires
+// when the sound right now is several times louder than background AND above
+// a minimum floor AND it rose suddenly (claps do, voices mostly ramp up).
+// ===========================================================================
+const mic = { on: false, stream: null, analyser: null, buf: null, bg: 0.004, hist: [], last: -10, rms: 0, thr: 0 };
+const micBtn = document.getElementById('micBtn');
+const micMsg = document.getElementById('micMsg');
+const meter = document.getElementById('meter');
+const meterCtx = meter.getContext('2d');
+
+async function toggleMic() {
+  if (mic.on) {
+    mic.stream.getTracks().forEach(t => t.stop());
+    mic.on = false;
+    micBtn.textContent = 'Enable mic';
+    meter.style.display = 'none';
+    micMsg.textContent = '';
+    return;
+  }
+  ensureAudio();
+  if (!navigator.mediaDevices?.getUserMedia) {
+    micMsg.textContent = 'Mic needs http://localhost or https. Clicking still works.';
+    return;
+  }
+  try {
+    // Turn off the browser's voice processing: noise suppression would eat
+    // claps, auto gain would keep changing the levels we measure.
+    mic.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (err) {
+    micMsg.textContent = err.name === 'NotAllowedError'
+      ? 'Mic permission denied. Clicking still works. To allow it, use the icon at the left of the address bar.'
+      : 'Could not open a microphone (' + err.name + '). Clicking still works.';
+    return;
+  }
+  const src = audio.ctx.createMediaStreamSource(mic.stream);
+  mic.analyser = audio.ctx.createAnalyser();
+  mic.analyser.fftSize = 1024;               // ~21 ms of audio per reading
+  mic.buf = new Float32Array(mic.analyser.fftSize);
+  src.connect(mic.analyser);                 // NOT to the speakers
+  Object.assign(mic, { on: true, bg: 0.004, hist: [], last: -10 });
+  micBtn.textContent = 'Disable mic';
+  meter.style.display = 'block';
+  micMsg.textContent = 'Listening. Clap!';
+}
+micBtn.addEventListener('click', toggleMic);
+
+function updateMic(now) {
+  if (!mic.on) return;
+  mic.analyser.getFloatTimeDomainData(mic.buf);
+  // RMS (root mean square) = the "average power" of the samples: a steady loudness number.
+  let sum = 0;
+  for (let i = 0; i < mic.buf.length; i++) sum += mic.buf[i] * mic.buf[i];
+  const rms = Math.sqrt(sum / mic.buf.length);
+
+  // Sensitivity 1..10 -> how many times louder than background, and a floor.
+  const s = settings.sensitivity;
+  const mult = 14 - s;                        // 13x (deaf) .. 4x (twitchy)
+  const floor = 0.006 * (11 - s);             // 0.06 .. 0.006
+  const thr = Math.max(mic.bg * mult, floor);
+  // "Sudden": compare against the level ~5 frames (~80 ms) ago.
+  const before = mic.hist.length >= 5 ? mic.hist[mic.hist.length - 5] : rms;
+  // Our own thunder comes out of the speakers into the mic: ignore the mic
+  // while it plays (plus 0.3 s), unless the user wears headphones.
+  const suppressed = !settings.headphones && now < audio.thunderUntil + 0.3;
+
+  if (!suppressed && now - mic.last > 1.5 && rms > thr && rms > before * 2) {
+    mic.last = now;
+    // Louder = bigger strike: each doubling over the threshold adds 0.3.
+    const strength = Math.min(1, 0.35 + Math.log2(rms / thr) * 0.3);
+    triggerStrike(rand(0.15, 0.85), strength);
+  }
+  // Learn the background only from "normal" frames, never from claps or our thunder.
+  // Rises slowly, falls faster: a quiet room is re-learned quickly.
+  if (!suppressed && rms < thr) mic.bg += (rms - mic.bg) * (rms > mic.bg ? 0.02 : 0.08);
+  mic.hist.push(rms);
+  if (mic.hist.length > 10) mic.hist.shift();
+  mic.rms = rms; mic.thr = thr;
+  drawMeter(suppressed);
+}
+
+// Level meter in decibels (-60 dB .. 0 dB) with the trigger threshold as a line.
+function drawMeter(suppressed) {
+  const W = meter.width, H = meter.height;
+  const db = v => Math.max(0, Math.min(1, (20 * Math.log10(v + 1e-9) + 60) / 60));
+  meterCtx.clearRect(0, 0, W, H);
+  meterCtx.fillStyle = suppressed ? '#555c6e' : mic.rms > mic.thr ? '#f0d36b' : '#5f8fd8';
+  meterCtx.fillRect(0, 0, db(mic.rms) * W, H);
+  meterCtx.fillStyle = '#ff6b6b';
+  meterCtx.fillRect(Math.round(db(mic.thr) * W) - 1, 0, 2, H);
+}
+
+// ===========================================================================
+// Settings panel
+// ===========================================================================
+const panel = document.getElementById('panel');
+function bindSlider(id, key, fmt, onChange) {
+  const el = document.getElementById(id), out = document.getElementById('v' + id[0].toUpperCase() + id.slice(1));
+  el.value = settings[key];
+  out.textContent = fmt(settings[key]);
+  el.addEventListener('input', () => {
+    settings[key] = parseFloat(el.value);
+    out.textContent = fmt(settings[key]);
+    onChange?.();
+  });
+}
+const pct = v => Math.round(v * 100) + '%';
+bindSlider('sens', 'sensitivity', v => v);
+bindSlider('rain', 'rain', pct);
+bindSlider('clouds', 'clouds', pct);
+bindSlider('scale', 'scale', pct, resize);
+document.getElementById('headphones').addEventListener('change', e => { settings.headphones = e.target.checked; });
+document.getElementById('mute').addEventListener('change', e => { ensureAudio(); setMuted(e.target.checked); });
 
 // ===========================================================================
 // Input
@@ -579,6 +740,7 @@ canvas.addEventListener('pointerdown', e => {
 });
 addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') { ensureAudio(); setMuted(!audio.muted); }
+  if (e.key === 'h' || e.key === 'H') panel.classList.toggle('open');
 });
 
 // ===========================================================================
@@ -590,6 +752,7 @@ const t0 = performance.now();
 
 function frame(now) {
   const t = (now - t0) / 1000;
+  updateMic(now / 1000);
   const s = updateStrike(now / 1000);
   updateRainSound(t);
 
