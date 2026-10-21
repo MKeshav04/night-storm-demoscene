@@ -82,6 +82,7 @@ uniform float uRain;       // rain amount 0..1
 uniform float uCloud;      // cloud density 0..1
 uniform float uFlash;      // in-cloud light right now, 0..~1.5
 uniform vec2  uFlashPos;   // centre of the in-cloud discharge (p coordinates)
+uniform float uFlashR;     // how far that light spreads (smaller = farther / weaker flash)
 uniform float uMain;       // brightness of the main channel right now
 uniform float uBranch;     // brightness of the branches right now
 uniform sampler2D uCore;   // sharp bolt:     R = main channel, G = branches
@@ -179,6 +180,16 @@ float rainLayer(vec2 p, float cols, float cellH, float speed, float seed, float 
   return across * along * (0.6 + 0.4 * hash11(di + ci));
 }
 
+// A lower, ragged layer of cloud ("scud") drifting faster in front of the
+// main deck. Real storm photos are full of it: dark shapes cutting across the
+// bolt and blocking the glow behind. 0 = clear, 1 = solid.
+float frontCloud(vec2 p) {
+  vec2 q = p * vec2(2.0, 2.6) + vec2(uTime * 0.035 + 40.0, uTime * 0.008 + 13.0);
+  float n = fbm(q + fbm(q * 0.6, 2) * 0.8, 4);
+  float lo = 0.64 - uCloud * 0.16;
+  return smoothstep(lo, lo + 0.16, n);
+}
+
 // Filmic tone curve (the widely published Narkowicz ACES fit): squeezes very
 // bright values smoothly into 0..1 instead of clipping, keeps darks dark.
 vec3 toneMap(vec3 x) {
@@ -199,15 +210,18 @@ void main() {
 
   // Light from the visible channel (blurred far out), hitting the cloud base.
   float wide = dot(texture(uWide, uv).rg, ch);
+  float inCloud = 0.0, fromBolt = 0.0;
 
   if (uFlash > 0.002 || wide > 0.0005) {
-    // In-cloud discharge: light spreads from uFlashPos through the cloud.
-    // The falloff is an ellipse, wider than tall: cloud layers are flat.
-    float fall = exp(-length((p - uFlashPos) * vec2(0.65, 1.15)) * 2.0);
+    // In-cloud discharge: light spreads from uFlashPos through the cloud and
+    // fades with distance, so a flash lights *its* part of the sky, not the
+    // whole screen. The falloff is an ellipse, wider than tall: cloud layers are flat.
+    float dist = length((p - uFlashPos) * vec2(0.65, 1.15));
+    float fall = exp(-dist / uFlashR);
     float T = uFlash * fall > 0.004 ? transmittance(p, uFlashPos) : 0.0;
-    float inCloud = uFlash * (0.03 + fall * (0.08 + 1.4 * T));
+    inCloud = uFlash * fall * (0.06 + 1.5 * T);
     // Light from the channel: cloud base facing us reflects more where denser.
-    float fromBolt = wide * 3.0;
+    fromBolt = wide * 3.0;
     light = inCloud + fromBolt;
     // d*d: thin cloud stays dim, thick billows catch the light. That
     // contrast is what makes the cloud look solid instead of like fog.
@@ -221,6 +235,14 @@ void main() {
   col += vec3(1.0, 0.97, 1.0) * core * 11.0;
   col += vec3(0.62, 0.66, 1.0) * halo * 1.7;
   light += halo * 0.6;
+
+  // Front scud: blocks most of what's behind it (lit cloud, bolt, glow).
+  // It's lit only weakly itself: a little from the bolt in front of it and
+  // a faint glow through it from the flash behind. Dark against bright.
+  float fc = frontCloud(p);
+  col *= 1.0 - 0.88 * fc;
+  col += FLASH_COL * fc * (fromBolt * 0.35 + halo * 0.25 + inCloud * 0.08) + vec3(0.0012, 0.0013, 0.0017) * fc;
+  light *= 1.0 - 0.5 * fc;
 
   // Rain: you only really see it when lightning lights it up.
   float amt = uRain * 0.7;
@@ -281,7 +303,7 @@ gl.useProgram(prog);
 gl.bindVertexArray(gl.createVertexArray()); // empty VAO: the vertex shader makes its own positions
 
 const U = {};
-for (const name of ['uRes', 'uTime', 'uRain', 'uCloud', 'uFlash', 'uFlashPos', 'uMain', 'uBranch',
+for (const name of ['uRes', 'uTime', 'uRain', 'uCloud', 'uFlash', 'uFlashPos', 'uFlashR', 'uMain', 'uBranch',
                     'uCore', 'uHalo', 'uWide']) U[name] = gl.getUniformLocation(prog, name);
 
 // Three bolt textures on texture units 0, 1, 2. Start as 1×1 black.
@@ -400,6 +422,17 @@ function makeBolt(cx, size) {
   return { lines, start: [sx, Math.min(sy, 0.92)] };
 }
 
+// In-cloud flash: the discharge stays inside the cloud. You never see a sharp
+// channel, only a patch of cloud lighting up from within, sometimes with
+// faint glowing veins crawling through it. Most real lightning is like this.
+function makeInCloud(cx, cy) {
+  const lines = [];
+  for (let k = 0, n = Math.floor(rand(1, 4)); k < n; k++)
+    lines.push({ pts: walkDir(cx + rand(-0.05, 0.05), cy + rand(-0.04, 0.04), rand(0, Math.PI * 2), rand(0.08, 0.3)),
+                 ch: 1, w0: 1.6, w1: 0.8, b0: rand(0.25, 0.5), b1: 0.03, fadeIn: 5, inCloud: true });
+  return { lines, start: [cx, cy] };
+}
+
 // Draw all lines into a 2D canvas: main channel in red, branches in green.
 // 'lighten' keeps the brightest value per pixel, so where segments overlap at
 // joints they don't add up into bright dots.
@@ -477,47 +510,66 @@ function renderBolt(lines, size) {
 }
 
 // ===========================================================================
-// Strike timing. A real cloud-to-ground flash is several "return strokes"
-// down the same channel, 30-120 ms apart. The first stroke lights up all the
-// branches; later strokes only light the main channel. Sometimes the cloud
-// flickers just before the bolt appears, and sometimes the channel keeps
-// glowing for a moment after a stroke ("continuing current").
+// Strike timing. Two kinds, like a real storm:
+//  - Cloud-to-ground ("cg"): several "return strokes" down the same channel,
+//    30-120 ms apart. The first stroke lights up all the branches; later
+//    strokes only the main channel. Sometimes the cloud flickers just before
+//    the bolt appears, and sometimes the channel keeps glowing for a moment
+//    ("continuing current").
+//  - In-cloud ("ic"): no visible bolt. A patch of cloud flickers irregularly
+//    for up to a second as the discharge crawls around inside it.
 // ===========================================================================
 const strike = { active: false, start: 0, events: [], end: 0, size: 1, gain: 1 };
 
-function triggerStrike(xFrac, strength) {
+function triggerStrike(xFrac, strength, yFrac) {
   const aspect = canvas.width / canvas.height;
-  // Distance in km: louder clap / stronger strike = closer. Close bolts are
-  // bigger and brighter, and their thunder comes sooner and louder.
-  // Kept at 1-3 km for a calm storm: no blinding overhead strikes, and the
-  // air softens the thunder into a deep roll before it reaches you.
-  const distKm = clamp((2.6 - strength * 1.4) * rand(0.85, 1.15), 1.0, 3);
-  const size = clamp(Math.pow(0.9 / distKm, 0.5), 0.6, 1.5);
-
-  const bolt = makeBolt(xFrac * aspect, size);
-  renderBolt(bolt.lines, size);
-  gl.uniform2f(U.uFlashPos, bolt.start[0], bolt.start[1]);
-
+  // Louder clap / stronger strike = more likely a visible bolt, and closer.
+  // About a third of strikes stay inside the cloud.
+  const kind = Math.random() < (strength > 0.65 ? 0.2 : 0.45) ? 'ic' : 'cg';
+  // Distance in km. Kept at 1-3 km for a calm storm: no blinding overhead
+  // strikes, and the air softens the thunder into a deep roll.
+  const distKm = clamp((2.6 - strength * 1.4) * rand(0.85, 1.15) * (kind === 'ic' ? 1.2 : 1), 1.0, 3.2);
+  const size = clamp(Math.pow(0.9 / distKm, 0.5), 0.55, 1.5);
   const ev = [];
   let t = 0;
-  if (Math.random() < 0.5) {                 // in-cloud flicker before the bolt
-    ev.push({ t: 0, main: 0, branch: 0, cloud: rand(0.12, 0.3), tau: 0.04 });
-    t = rand(0.05, 0.14);
+
+  if (kind === 'cg') {
+    const bolt = makeBolt(xFrac * aspect, size);
+    renderBolt(bolt.lines, size);
+    gl.uniform2f(U.uFlashPos, bolt.start[0], bolt.start[1]);
+    gl.uniform1f(U.uFlashR, rand(0.3, 0.5) * size);
+    if (Math.random() < 0.5) {                 // in-cloud flicker before the bolt
+      ev.push({ t: 0, main: 0, branch: 0, cloud: rand(0.12, 0.3), tau: 0.04 });
+      t = rand(0.05, 0.14);
+    }
+    const first = t;
+    ev.push({ t, main: 1, branch: 1, cloud: 1, tau: 0.05 });
+    const strokes = Math.floor(rand(1, 5));    // 1-4 more strokes
+    for (let i = 0; i < strokes; i++) {
+      t += rand(0.035, 0.12);
+      ev.push({ t, main: rand(0.4, 0.95), branch: 0.06, cloud: rand(0.45, 0.85), tau: rand(0.035, 0.06) });
+      if (Math.random() < 0.25)                // continuing current: a lingering glow
+        ev.push({ t: t + 0.01, main: 0.3, branch: 0, cloud: 0.25, tau: rand(0.1, 0.18) });
+    }
+    ev.push({ t: first, main: 0, branch: 0, cloud: 0.2, tau: 0.35 });   // clouds' slow afterglow
+  } else {
+    // Where in the sky: the click height if we have one, else somewhere up high.
+    const cy = clamp(yFrac ?? rand(0.45, 0.9), 0.3, 0.95);
+    const cx = clamp(xFrac * aspect + rand(-0.1, 0.1), 0.05, aspect - 0.05);
+    renderBolt(makeInCloud(cx, cy).lines, size);
+    gl.uniform2f(U.uFlashPos, cx, cy);
+    gl.uniform1f(U.uFlashR, rand(0.12, 0.28) * size);
+    // Irregular flickering: 3-8 pulses of varying strength over 0.3-1 s.
+    for (let i = 0, n = Math.floor(rand(3, 9)); i < n; i++) {
+      ev.push({ t, main: 0, branch: rand(0.3, 1), cloud: rand(0.35, 1.2), tau: rand(0.04, 0.12) });
+      t += rand(0.03, 0.16);
+    }
+    ev.push({ t: 0, main: 0, branch: 0, cloud: 0.15, tau: 0.4 });
   }
-  const first = t;
-  ev.push({ t, main: 1, branch: 1, cloud: 1, tau: 0.05 });
-  const strokes = Math.floor(rand(1, 5));    // 1-4 more strokes
-  for (let i = 0; i < strokes; i++) {
-    t += rand(0.035, 0.12);
-    ev.push({ t, main: rand(0.4, 0.95), branch: 0.06, cloud: rand(0.45, 0.85), tau: rand(0.035, 0.06) });
-    if (Math.random() < 0.25)                // continuing current: a lingering glow
-      ev.push({ t: t + 0.01, main: 0.3, branch: 0, cloud: 0.25, tau: rand(0.1, 0.18) });
-  }
-  ev.push({ t: first, main: 0, branch: 0, cloud: 0.2, tau: 0.35 });   // clouds' slow afterglow
   Object.assign(strike, { active: true, start: performance.now() / 1000, events: ev, end: t + 2, size,
                           gain: 0.35 + strength * 0.45 });
 
-  scheduleThunder(distKm, xFrac);
+  scheduleThunder(distKm, xFrac, kind);
   document.getElementById('hint').classList.add('gone');
 }
 
@@ -546,27 +598,87 @@ function updateStrike(now) {
 // are computed right after page load at 48 kHz; the browser resamples them.
 // ===========================================================================
 const SR = 48000;
-const audio = { ctx: null, master: null, rainGain: null, reverb: null, muted: false, thunders: [] };
+const audio = { ctx: null, master: null, rainBus: null, washGain: null, patterGain: null, reverb: null,
+                muted: false, thunders: [], drips: [] };
 
-// Rain: thousands of individual drop "ticks" (tiny decaying pings at random
-// pitches, mostly quiet, a few loud ones close by) over a soft hiss. Drops wrap
-// around the end of the buffer so the 6 s loop has no audible seam.
-function makeRainData() {
-  const N = SR * 6, chans = [];
-  for (let c = 0; c < 2; c++) {
-    const d = new Float32Array(N);
-    let lp = 0;
-    for (let i = 0; i < N; i++) { lp += (Math.random() * 2 - 1 - lp) * 0.25; d[i] = lp * 0.12; }
-    for (let k = 0; k < 6 * 900; k++) {
-      const pos = Math.floor(Math.random() * N);
-      const amp = Math.pow(Math.random(), 3) * 0.5;
-      const w = 2 * Math.PI * rand(1200, 6000) / SR;
-      const decay = rand(0.001, 0.005) * SR;
-      for (let j = 0, len = decay * 4; j < len; j++) d[(pos + j) % N] += amp * Math.exp(-j / decay) * Math.sin(w * j);
-    }
-    chans.push(d);
-  }
+// Scale a set of channels so their RMS (average loudness) equals `target`.
+function normalize(chans, target) {
+  let s = 0, n = 0;
+  for (const d of chans) for (let i = 0; i < d.length; i++) { s += d[i] * d[i]; n++; }
+  const k = target / (Math.sqrt(s / n) + 1e-9);
+  for (const d of chans) for (let i = 0; i < d.length; i++) d[i] *= k;
   return chans;
+}
+
+// Rain is built in layers, like what you actually hear:
+//  wash   = rain falling everywhere far away: a dense, soft "shhh"
+//  patter = nearby individual impacts: tiny noise "ticks", mostly faint, a
+//           few big close drops with a bit of body, and the odd "plink" of a
+//           drop hitting a puddle (a short tone whose pitch rises slightly)
+//  drips  = water dripping off an edge, scheduled live (see updateRainSound)
+// Wash and patter loops are 7 s and 11 s long, so together they only repeat
+// every 77 s, and every sound wraps around its buffer's end: no seam.
+function makeRainData() {
+  // Wash: pink-ish noise (more energy in the lows than white noise, sounds
+  // softer). Made by adding white noise to a few smoothed copies of itself.
+  const NW = SR * 7, wash = [];
+  for (let c = 0; c < 2; c++) {
+    const d = new Float32Array(NW);
+    let b1 = 0, b2 = 0, b3 = 0;
+    for (let i = 0; i < NW; i++) {
+      const w = Math.random() * 2 - 1;
+      b1 += (w - b1) * 0.6; b2 += (w - b2) * 0.15; b3 += (w - b3) * 0.03;
+      d[i] = w * 0.3 + b1 * 0.5 + b2 + b3 * 1.5;
+    }
+    // Crossfade the last 0.2 s into the start so the loop point is invisible.
+    const F = SR * 0.2;
+    for (let i = 0; i < F; i++) { const a = i / F; d[i] = d[i] * a + d[NW - F + i] * (1 - a); }
+    wash.push(d.subarray(0, NW - F));
+  }
+
+  const NP = SR * 11, patter = [];
+  for (let c = 0; c < 2; c++) {
+    const d = new Float32Array(NP);
+    // Impacts: ~1800 per second per ear.
+    for (let k = 0; k < 11 * 1800; k++) {
+      const pos = Math.floor(Math.random() * NP);
+      const r = Math.random();
+      const amp = 0.015 + 0.5 * r * r * r * r * r;          // mostly faint, rarely loud
+      const tau = rand(0.15, 0.9) * SR / 1000;              // 0.15-0.9 ms decay
+      const bright = rand(0.15, 0.85);                      // how "hard" the surface sounds
+      let y = 0;
+      for (let j = 0, len = tau * 6; j < len; j++) {
+        y += ((Math.random() * 2 - 1) - y) * bright;        // filtered noise burst
+        d[(pos + j) % NP] += amp * y * Math.exp(-j / tau);
+      }
+      if (amp > 0.15) {                                     // big drop: a little low "tap"
+        const w = 2 * Math.PI * rand(250, 700) / SR, t2 = 0.003 * SR;
+        for (let j = 0; j < t2 * 5; j++) d[(pos + j) % NP] += amp * 0.5 * Math.sin(w * j) * Math.exp(-j / t2);
+      }
+    }
+    // Puddle plinks: ~20 per second per ear. Pitch rises ~25% as it rings.
+    for (let k = 0; k < 11 * 20; k++) {
+      const pos = Math.floor(Math.random() * NP);
+      const f0 = rand(1400, 4200), tau = rand(0.004, 0.012) * SR, amp = rand(0.02, 0.09);
+      let ph = 0;
+      for (let j = 0; j < tau * 5; j++) {
+        ph += 2 * Math.PI * f0 * (1 + 0.25 * j / (tau * 5)) / SR;
+        d[(pos + j) % NP] += amp * Math.sin(ph) * Math.exp(-j / tau);
+      }
+    }
+    patter.push(d);
+  }
+
+  // One drip: a "plop" whose pitch sweeps up fast (the bubble a drop makes
+  // when it hits water), with a tiny click at the start.
+  const drip = new Float32Array(Math.floor(SR * 0.12));
+  let ph = 0;
+  for (let j = 0; j < drip.length; j++) {
+    const t = j / SR;
+    ph += 2 * Math.PI * 600 * (1 + 1.4 * (1 - Math.exp(-t / 0.01))) / SR;
+    drip[j] = Math.sin(ph) * Math.exp(-t / 0.018) * 0.8 + (Math.random() * 2 - 1) * Math.exp(-t / 0.0007) * 0.4;
+  }
+  return { wash: normalize(wash, 0.1), patter: normalize(patter, 0.1), drip };
 }
 
 // Echo: stereo impulse response for a ConvolverNode. Decaying noise (the
@@ -590,8 +702,9 @@ function makeEchoData() {
   return chans;
 }
 
+// Rain takes ~0.35 s to build, so the background worker makes it (see below).
 let rainData = null, echoData = null;
-setTimeout(() => { rainData = makeRainData(); echoData = makeEchoData(); }, 300);
+setTimeout(() => { echoData ||= makeEchoData(); }, 300);
 
 function toBuffer(ctx, chans) {
   const b = ctx.createBuffer(chans.length, chans[0].length, SR);
@@ -601,7 +714,7 @@ function toBuffer(ctx, chans) {
 
 function ensureAudio() {
   if (audio.ctx) { if (audio.ctx.state === 'suspended') audio.ctx.resume(); return; }
-  if (!rainData) { rainData = makeRainData(); echoData = makeEchoData(); }
+  echoData ||= makeEchoData();
   const ctx = new AudioContext();
   audio.ctx = ctx;
   // master gain (mute) -> compressor (keeps close strikes from clipping) -> speakers
@@ -616,20 +729,61 @@ function ensureAudio() {
   const wet = ctx.createGain(); wet.gain.value = 0.45;
   audio.reverb.connect(wet).connect(audio.master);
 
-  const src = ctx.createBufferSource();
-  src.buffer = toBuffer(ctx, rainData);
-  src.loop = true;
-  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 250;
-  audio.rainGain = ctx.createGain();
-  audio.rainGain.gain.value = 0;
-  src.connect(hp).connect(audio.rainGain).connect(audio.master);
-  src.start();
+  audio.rainBus = ctx.createGain();
+  audio.rainBus.gain.value = 0;
+  audio.rainBus.connect(audio.master);
+  setupRain();
 }
 
+// Rain: wash and patter loops -> their own gains -> rain bus (slider) -> master.
+// Runs once both the AudioContext and the worker's rain data exist,
+// whichever comes second.
+function setupRain() {
+  const ctx = audio.ctx;
+  if (!ctx || !rainData || audio.washGain) return;
+  const loop = (chans, gain, filters) => {
+    const src = ctx.createBufferSource();
+    src.buffer = toBuffer(ctx, chans);
+    src.loop = true;
+    const g = ctx.createGain(); g.gain.value = gain;
+    let node = src;
+    for (const [type, f] of filters) { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; node = node.connect(b); }
+    node.connect(g).connect(audio.rainBus);
+    src.start();
+    return g;
+  };
+  // Distant wash: no deep rumble, no harsh top. Patter: keep the crisp ticks.
+  audio.washGain = loop(rainData.wash, 0.9, [['highpass', 350], ['lowpass', 6000]]);
+  audio.patterGain = loop(rainData.patter, 0.7, [['highpass', 200]]);
+  audio.dripBuf = toBuffer(ctx, [rainData.drip]);
+  // Two drips off an edge somewhere, each with its own rhythm, pitch and side.
+  audio.drips = [{ every: rand(0.7, 1.1), pitch: rand(0.8, 1.1), pan: -0.55, next: 0 },
+                 { every: rand(1.4, 2.2), pitch: rand(1.1, 1.5), pan: 0.45, next: 0 }];
+}
+
+// Slow, irregular swell of the rain ("gusts"): a few slow waves added together.
+const gust = t => 0.5 + 0.25 * Math.sin(t * 0.21) + 0.15 * Math.sin(t * 0.077 + 1.3) + 0.1 * Math.sin(t * 0.43 + 4.1);
+
 function updateRainSound(t) {
-  if (!audio.ctx) return;
-  const target = settings.rain * 0.5 * (0.88 + 0.12 * Math.sin(t * 0.37) * Math.sin(t * 0.11));
-  audio.rainGain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.3);
+  if (!audio.ctx || !audio.washGain) return;
+  const ctx = audio.ctx, now = ctx.currentTime, g = gust(t);
+  audio.rainBus.gain.setTargetAtTime(settings.rain * 0.3, now, 0.3);
+  audio.washGain.gain.setTargetAtTime(0.9 * (0.75 + 0.5 * g), now, 0.5);
+  audio.patterGain.gain.setTargetAtTime(0.7 * (0.8 + 0.4 * g), now, 0.5);
+
+  // Drips: schedule the next one when it's due. Slightly irregular timing,
+  // pitch and loudness, like water collecting and letting go.
+  for (const d of audio.drips) {
+    if (now < d.next || settings.rain < 0.05) continue;
+    d.next = now + d.every * rand(0.75, 1.3);
+    const s = ctx.createBufferSource();
+    s.buffer = audio.dripBuf;
+    s.playbackRate.value = d.pitch * rand(0.94, 1.06);
+    const gn = ctx.createGain(); gn.gain.value = rand(0.4, 0.8);   // the rain bus already follows the slider
+    const pn = ctx.createStereoPanner(); pn.pan.value = d.pan;
+    s.connect(gn).connect(pn).connect(audio.rainBus);
+    s.start(now + rand(0, 0.05));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +798,7 @@ function updateRainSound(t) {
 // into rumble. Air also absorbs high frequencies with distance, so the later,
 // farther sound is duller. We simulate exactly that.
 // ---------------------------------------------------------------------------
-function buildThunder(distM) {
+function buildThunder(distM, kind) {
   const C = 343;
   const segs = [];               // x, y, z, energy per ~6 m of channel
   const STEP_M = 6;
@@ -670,13 +824,19 @@ function buildThunder(distM) {
   }
   const az = rand(0, Math.PI * 2);
   const ground = [Math.cos(az) * distM, Math.sin(az) * distM, 0];
-  const cloudBase = rand(1300, 2200);
-  const main = walk3(ground, [0, 0, 1], 8000, 1, cloudBase);
-  const top = main[main.length - 1];
-  for (let k = 0, n = Math.floor(rand(3, 7)); k < n; k++) {         // branches below the cloud
-    const from = main[Math.floor(rand(0.3, 0.95) * main.length)];
-    const a = rand(0, Math.PI * 2);
-    walk3(from, [Math.cos(a) * 0.6, Math.sin(a) * 0.6, -0.8], rand(150, 600), 0.35);
+  let top;
+  if (kind === 'ic') {
+    // In-cloud: no channel to the ground. All the sound comes from high up
+    // and far away, so it's a soft, late, rolling rumble with no crack.
+    top = [ground[0], ground[1], rand(2000, 3500)];
+  } else {
+    const main = walk3(ground, [0, 0, 1], 8000, 1, rand(1300, 2200));
+    top = main[main.length - 1];
+    for (let k = 0, n = Math.floor(rand(3, 7)); k < n; k++) {       // branches below the cloud
+      const from = main[Math.floor(rand(0.3, 0.95) * main.length)];
+      const a = rand(0, Math.PI * 2);
+      walk3(from, [Math.cos(a) * 0.6, Math.sin(a) * 0.6, -0.8], rand(150, 600), 0.35);
+    }
   }
   for (let k = 0, n = Math.floor(rand(2, 4)); k < n; k++) {         // long channels inside the cloud
     const a = rand(0, Math.PI * 2);
@@ -753,29 +913,41 @@ function buildThunder(distM) {
   return { data: x, delay: rMin / C - PRE, env: envBlocks };
 }
 
-// Building thunder takes ~0.1 s of maths, which would freeze the animation.
-// So it runs in a Web Worker (a background thread). We make the worker from
+// Building thunder (~0.1 s) and rain (~0.35 s) would freeze the animation.
+// So they run in a Web Worker (a background thread). We make the worker from
 // the source text of the functions above, so it's still one HTML file.
 const thunderWorker = new Worker(URL.createObjectURL(new Blob([`
   const SR = ${SR}; const rand = ${rand}; const clamp = ${clamp}; const gauss = ${gauss};
   ${buildThunder}
+  ${normalize}
+  ${makeRainData}
   onmessage = e => {
-    const th = buildThunder(e.data.distM);
+    if (e.data.rain) {
+      const r = makeRainData();
+      postMessage({ rain: r }, [...r.wash, ...r.patter, r.drip].map(a => a.buffer));
+      return;
+    }
+    const th = buildThunder(e.data.distM, e.data.kind);
     postMessage({ id: e.data.id, ...th }, [th.data.buffer, th.env.buffer]);
   };`], { type: 'text/javascript' })));
 const thunderJobs = new Map();
 let thunderId = 0;
-thunderWorker.onmessage = e => { thunderJobs.get(e.data.id)?.(e.data); thunderJobs.delete(e.data.id); };
+thunderWorker.onmessage = e => {
+  if (e.data.rain) { rainData = e.data.rain; setupRain(); return; }
+  thunderJobs.get(e.data.id)?.(e.data);
+  thunderJobs.delete(e.data.id);
+};
+thunderWorker.postMessage({ rain: true });
 
 // Ask the worker for a thunder, then start it exactly when the first sound
 // would arrive (flash time + nearest distance / speed of sound).
-function scheduleThunder(distKm, xFrac) {
+function scheduleThunder(distKm, xFrac, kind) {
   ensureAudio();
   const ctx = audio.ctx;
   const flashAt = ctx.currentTime;
   const perfFlash = performance.now() / 1000;
   const id = ++thunderId;
-  thunderWorker.postMessage({ id, distM: distKm * 1000 });
+  thunderWorker.postMessage({ id, distM: distKm * 1000, kind });
   thunderJobs.set(id, th => {
     const buf = ctx.createBuffer(1, th.data.length, SR);
     buf.copyToChannel(th.data, 0);
@@ -812,12 +984,23 @@ function setMuted(m) {
 }
 
 // ===========================================================================
-// Microphone trigger: onset detection
-// Track the room's normal loudness slowly ("background"). A strike fires when
-// the sound right now is several times louder than background AND above a
-// minimum floor AND it rose suddenly (claps do; voices mostly ramp up).
+// Microphone trigger: transient detection
+// A clap, snap, knock or desk slap is a *burst*: it rises out of quiet in a
+// few milliseconds and is mostly gone ~10 ms later. A voice keeps sounding
+// for 100+ ms per syllable. Average loudness (RMS) can't tell them apart (and
+// even favours voices), so instead we look at the *shape* of the sound:
+//   1. Filter out everything below ~1 kHz. Claps are loudest at 1-5 kHz,
+//      voices mostly below, so a clap stands out even while you talk.
+//   2. Cut the last ~43 ms into 1 ms blocks and take each block's loudest
+//      sample: a coarse loudness curve (the "envelope").
+//   3. Find where the sound jumps up. Compare with what was sounding 2-10 ms
+//      before (room noise, or a voice) and 20-26 ms after. Jumped to 2.5x+
+//      above it and fell most of the way back? That's a percussive hit.
+//      (A clap has a few quick sub-bursts and a short ring, so we don't
+//      demand a single clean spike.) A voice never falls back that fast.
+// Strike when that hit is well above the room's usual level.
 // ===========================================================================
-const mic = { on: false, stream: null, analyser: null, buf: null, bg: 0.004, hist: [], last: -10, rms: 0, thr: 0 };
+const mic = { on: false, stream: null, analyser: null, buf: null, env: null, bgPeak: 0.01, last: -10, peak: 0, thr: 0 };
 const micBtn = document.getElementById('micBtn');
 const micMsg = document.getElementById('micMsg');
 const meter = document.getElementById('meter');
@@ -857,62 +1040,87 @@ async function toggleMic() {
     return;
   }
   const src = audio.ctx.createMediaStreamSource(mic.stream);
+  // Two high-pass filters at 1 kHz (a steep cut): removes hum, rumble, our own
+  // thunder and most of a voice, while claps (mostly 1-5 kHz) pass through.
+  const hp1 = audio.ctx.createBiquadFilter(), hp2 = audio.ctx.createBiquadFilter();
+  hp1.type = hp2.type = 'highpass';
+  hp1.frequency.value = hp2.frequency.value = 1000;
   mic.analyser = audio.ctx.createAnalyser();
-  mic.analyser.fftSize = 1024;               // ~21 ms of audio per reading
+  mic.analyser.fftSize = 4096;               // ~85 ms window, read every ~17 ms: each hit is seen whole in several frames
   mic.buf = new Float32Array(mic.analyser.fftSize);
-  src.connect(mic.analyser);
+  src.connect(hp1).connect(hp2).connect(mic.analyser);
   // Keep the analyser "pulled" by the audio graph through a silent gain, so the
   // browser never skips processing it. Gain 0 = the mic never reaches the speakers.
   const silent = audio.ctx.createGain();
   silent.gain.value = 0;
   mic.analyser.connect(silent).connect(audio.ctx.destination);
-  Object.assign(mic, { on: true, bg: 0.004, hist: [], last: -10 });
+  Object.assign(mic, { on: true, bgPeak: 0.01, last: -10 });
   micBtn.textContent = 'Disable mic';
   meter.style.display = 'block';
-  micMsg.textContent = 'Listening. Clap!';
+  micMsg.textContent = 'Listening. Clap, snap or knock on the desk.';
 }
 micBtn.addEventListener('click', toggleMic);
 
 function updateMic(now) {
   if (!mic.on) return;
   mic.analyser.getFloatTimeDomainData(mic.buf);
-  // RMS (root mean square) = the average power of the samples: a steady loudness number.
-  let sum = 0;
-  for (let i = 0; i < mic.buf.length; i++) sum += mic.buf[i] * mic.buf[i];
-  const rms = Math.sqrt(sum / mic.buf.length);
+  const b = mic.buf;
+  // Envelope: loudest sample in each 1 ms block.
+  const blk = Math.round(audio.ctx.sampleRate / 1000), nb = Math.floor(b.length / blk);
+  const E = mic.env && mic.env.length === nb ? mic.env : (mic.env = new Float32Array(nb));
+  let kpk = 0;
+  for (let k = 0; k < nb; k++) {
+    let m = 0;
+    for (let i = k * blk; i < (k + 1) * blk; i++) m = Math.max(m, Math.abs(b[i]));
+    E[k] = m;
+    if (m > E[kpk]) kpk = k;
+  }
+  const peak = E[kpk];
 
-  // Sensitivity 1..10 -> how many times louder than background, and a floor.
+  // Shape test. It needs 8 ms before and 26 ms after the start inside the
+  // window; if the hit is too close to an edge, a later frame (the window
+  // slides ~17 ms each frame) sees it in the middle.
+  // `base` = whatever was already sounding just before the hit: room noise,
+  // or someone talking. A hit must jump far above it and fall back to it.
+  let percussive = false;
+  // Walk back from the peak to where the burst began (a clap's sub-bursts
+  // span up to ~10 ms, so look back at most 12 ms).
+  let start = kpk;
+  while (start > 0 && kpk - start < 12 && E[start - 1] >= peak * 0.3) start--;
+  if (start >= 10 && start + 26 < nb) {
+    let base = mic.bgPeak * 1.5, post = 0;
+    for (let k = start - 10; k <= start - 2; k++) base = Math.max(base, E[k]);   // 2-10 ms before
+    for (let k = start + 20; k <= start + 26; k++) post = Math.max(post, E[k]);  // 20-26 ms after
+    percussive = base < peak * 0.4 && post < base + (peak - base) * 0.45;
+  }
+
+  // Sensitivity 1..10 -> how many times above the room's usual peaks, and a floor.
   const s = settings.sensitivity;
-  const mult = 14 - s;                        // 13x (deaf) .. 4x (twitchy)
-  const floor = 0.006 * (11 - s);             // 0.06 .. 0.006
-  const thr = Math.max(mic.bg * mult, floor);
-  // "Sudden": compare against the level ~5 frames (~80 ms) ago.
-  const before = mic.hist.length >= 5 ? mic.hist[mic.hist.length - 5] : rms;
+  const K = 2 + (10 - s) * 0.7;               // 8.3x (deaf) .. 2x (twitchy)
+  const floor = 0.004 * (11 - s);             // 0.04 .. 0.004
+  const thr = Math.max(mic.bgPeak * K, floor);
   // Our own thunder comes out of the speakers into the mic: ignore the mic
   // while it is loud, unless the user wears headphones.
   const suppressed = !settings.headphones && thunderLevel(now) > 0.04;
 
-  if (!suppressed && now - mic.last > 1.5 && rms > thr && rms > before * 2) {
+  if (!suppressed && now - mic.last > 1.2 && peak > thr && percussive) {
     mic.last = now;
-    // Louder = bigger, closer strike: each doubling over the threshold adds 0.3.
-    const strength = Math.min(1, 0.35 + Math.log2(rms / thr) * 0.3);
-    triggerStrike(rand(0.15, 0.85), strength);
+    // Louder = bigger, closer strike: each doubling over the threshold adds 0.25.
+    triggerStrike(rand(0.15, 0.85), Math.min(1, 0.3 + Math.log2(peak / thr) * 0.25));
   }
-  // Learn the background only from normal frames, never from claps or thunder.
-  if (!suppressed && rms < thr) mic.bg += (rms - mic.bg) * (rms > mic.bg ? 0.02 : 0.08);
-  mic.hist.push(rms);
-  if (mic.hist.length > 10) mic.hist.shift();
-  mic.rms = rms; mic.thr = thr;
+  // Learn the room's usual peaks only from normal frames, never from claps or thunder.
+  if (!suppressed && peak < thr) mic.bgPeak += (peak - mic.bgPeak) * (peak > mic.bgPeak ? 0.01 : 0.05);
+  mic.peak = peak; mic.thr = thr;
   drawMeter(suppressed);
 }
 
-// Level meter in decibels (-60 dB .. 0 dB) with the trigger threshold as a line.
+// Peak meter in decibels (-60 dB .. 0 dB) with the trigger threshold as a line.
 function drawMeter(suppressed) {
   const W = meter.width, H = meter.height;
   const db = v => clamp((20 * Math.log10(v + 1e-9) + 60) / 60, 0, 1);
   meterCtx.clearRect(0, 0, W, H);
-  meterCtx.fillStyle = suppressed ? '#555c6e' : mic.rms > mic.thr ? '#f0d36b' : '#5f8fd8';
-  meterCtx.fillRect(0, 0, db(mic.rms) * W, H);
+  meterCtx.fillStyle = suppressed ? '#555c6e' : mic.peak > mic.thr ? '#f0d36b' : '#5f8fd8';
+  meterCtx.fillRect(0, 0, db(mic.peak) * W, H);
   meterCtx.fillStyle = '#ff6b6b';
   meterCtx.fillRect(Math.round(db(mic.thr) * W) - 1, 0, 2, H);
 }
@@ -944,7 +1152,7 @@ document.getElementById('mute').addEventListener('change', e => { ensureAudio();
 // ===========================================================================
 canvas.addEventListener('pointerdown', e => {
   ensureAudio();
-  triggerStrike(e.clientX / innerWidth, rand(0.55, 0.9));
+  triggerStrike(e.clientX / innerWidth, rand(0.55, 0.9), 1 - e.clientY / innerHeight);
 });
 addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') { ensureAudio(); setMuted(!audio.muted); }
